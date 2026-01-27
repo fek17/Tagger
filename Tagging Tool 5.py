@@ -18,6 +18,39 @@ import pickle
 from dataclasses import dataclass
 import numpy as np
 import io
+import re
+
+
+def sanitize_for_excel(value):
+    """
+    Remove illegal characters that cannot be used in Excel worksheets.
+
+    openpyxl raises IllegalCharacterError for control characters (ASCII 0-31)
+    except for tab (9), newline (10), and carriage return (13).
+    """
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        return value
+
+    # Remove illegal control characters (ASCII 0-8, 11-12, 14-31)
+    # Keep tab (9), newline (10), carriage return (13)
+    illegal_chars_pattern = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+    cleaned = illegal_chars_pattern.sub('', value)
+
+    return cleaned
+
+
+def sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitize all string columns in a DataFrame to remove illegal Excel characters.
+    Returns a copy of the DataFrame with sanitized values.
+    """
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            df_clean[col] = df_clean[col].apply(sanitize_for_excel)
+    return df_clean
 
 @dataclass
 class TaxonomyConfig:
@@ -85,44 +118,51 @@ class GenericTagger:
         """Save checkpoint and automatically clean up old ones"""
         with self.file_lock:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
+
             # Always save pickle (can handle empty data)
             checkpoint_path_pkl = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.pkl"
             with open(checkpoint_path_pkl, 'wb') as f:
                 pickle.dump(results, f)
-            
+
             # Only create Excel if there's data to write
             checkpoint_path_xlsx = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.xlsx"
             has_data = False
-            
-            if isinstance(results, dict):
-                # Check if any job has results
-                sheets_to_write = {}
-                for key, data in results.items():
-                    if data and len(data) > 0:
-                        df = pd.DataFrame(data)
+
+            try:
+                if isinstance(results, dict):
+                    # Check if any job has results
+                    sheets_to_write = {}
+                    for key, data in results.items():
+                        if data and len(data) > 0:
+                            df = pd.DataFrame(data)
+                            if len(df) > 0:
+                                sheet_name = f"{key[0]}_{key[1]}"[:31]
+                                # Sanitize the dataframe to remove illegal characters
+                                sheets_to_write[sheet_name] = sanitize_dataframe_for_excel(df)
+                                has_data = True
+
+                    # Only create Excel file if we have data
+                    if has_data:
+                        with pd.ExcelWriter(checkpoint_path_xlsx, engine='openpyxl') as writer:
+                            for sheet_name, df in sheets_to_write.items():
+                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                else:
+                    # Handle list of results
+                    if results and len(results) > 0:
+                        df = pd.DataFrame(results)
                         if len(df) > 0:
-                            sheet_name = f"{key[0]}_{key[1]}"[:31]
-                            sheets_to_write[sheet_name] = df
+                            # Sanitize the dataframe to remove illegal characters
+                            sanitized_df = sanitize_dataframe_for_excel(df)
+                            sanitized_df.to_excel(checkpoint_path_xlsx, index=False)
                             has_data = True
-                
-                # Only create Excel file if we have data
-                if has_data:
-                    with pd.ExcelWriter(checkpoint_path_xlsx, engine='openpyxl') as writer:
-                        for sheet_name, df in sheets_to_write.items():
-                            df.to_excel(writer, sheet_name=sheet_name, index=False)
-            else:
-                # Handle list of results
-                if results and len(results) > 0:
-                    df = pd.DataFrame(results)
-                    if len(df) > 0:
-                        df.to_excel(checkpoint_path_xlsx, index=False)
-                        has_data = True
-            
+            except Exception as e:
+                # Log Excel checkpoint error but don't fail - pickle is the primary backup
+                print(f"Warning: Excel checkpoint save failed: {e}")
+
             # Clean up old files
             all_pkl_files = sorted(self.checkpoint_dir.glob("*.pkl"), key=lambda x: x.stat().st_mtime)
             all_xlsx_files = sorted(self.checkpoint_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime)
-            
+
             for old_file in all_pkl_files[:-2]:
                 try:
                     old_file.unlink()
@@ -133,7 +173,7 @@ class GenericTagger:
                     old_file.unlink()
                 except Exception:
                     pass
-            
+
             return checkpoint_path_pkl
     
     def load_checkpoint(self, checkpoint_path: str) -> List[Dict]:
@@ -1522,50 +1562,97 @@ def run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries
 def create_download_buttons(results_by_sheet):
     """Create download buttons for results"""
     st.header("📥 Download Results")
-    
-    col1, col2 = st.columns([2, 1])
-    
+
+    # Prepare tagged dataframes for all sheets
+    prepared_dfs = {}
+    for (filename, sheet_name), df in results_by_sheet.items():
+        if 'Status' in df.columns:
+            tagged_df = df[df['Status'].notna()].copy()
+        else:
+            result_cols = [col for col in df.columns if any(
+                keyword in col for keyword in ['Tagged_Result', 'Primary_Tag', 'Confidence', 'Status']
+            )]
+            if result_cols:
+                mask = df[result_cols].notna().any(axis=1)
+                tagged_df = df[mask].copy()
+            else:
+                tagged_df = df.copy()
+
+        if len(tagged_df) > 0:
+            prepared_dfs[(filename, sheet_name)] = tagged_df
+        else:
+            st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
+
+    if not prepared_dfs:
+        st.error("No results available to download. All sheets are empty.")
+        return
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+
+    # Excel download with error handling
     with col1:
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            sheets_written = 0
-            for (filename, sheet_name), df in results_by_sheet.items():
-                if 'Status' in df.columns:
-                    tagged_df = df[df['Status'].notna()].copy()
-                else:
-                    result_cols = [col for col in df.columns if any(
-                        keyword in col for keyword in ['Tagged_Result', 'Primary_Tag', 'Confidence', 'Status']
-                    )]
-                    if result_cols:
-                        mask = df[result_cols].notna().any(axis=1)
-                        tagged_df = df[mask].copy()
-                    else:
-                        tagged_df = df.copy()
-                
-                # Only write non-empty dataframes
-                if len(tagged_df) > 0:
+        excel_error = None
+        try:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                for (filename, sheet_name), tagged_df in prepared_dfs.items():
                     safe_sheet_name = sheet_name[:31]
-                    tagged_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
-                    sheets_written += 1
-                else:
-                    st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
-        
-        if sheets_written > 0:
+                    # Sanitize the dataframe to remove illegal characters
+                    sanitized_df = sanitize_dataframe_for_excel(tagged_df)
+                    sanitized_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
             st.download_button(
                 label="📥 Download All Results (Excel)",
                 data=output.getvalue(),
                 file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.error("No results available to download. All sheets are empty.")
-    
+        except Exception as e:
+            excel_error = str(e)
+            st.error(f"⚠️ Excel export failed: {excel_error}")
+            st.info("Please use the CSV download option instead.")
+
+    # CSV download as alternative/fallback
     with col2:
-        if st.button("🗑️ Clear Results from Memory"):
+        try:
+            # For multiple sheets, create a zip file with CSVs
+            if len(prepared_dfs) == 1:
+                # Single sheet - direct CSV download
+                (filename, sheet_name), tagged_df = list(prepared_dfs.items())[0]
+                csv_output = io.StringIO()
+                tagged_df.to_csv(csv_output, index=False)
+                st.download_button(
+                    label="📥 Download as CSV",
+                    data=csv_output.getvalue(),
+                    file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+            else:
+                # Multiple sheets - create zip with multiple CSVs
+                import zipfile
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    for (filename, sheet_name), tagged_df in prepared_dfs.items():
+                        csv_output = io.StringIO()
+                        tagged_df.to_csv(csv_output, index=False)
+                        safe_name = sheet_name[:31].replace('/', '_').replace('\\', '_')
+                        zip_file.writestr(f"{safe_name}.csv", csv_output.getvalue())
+
+                st.download_button(
+                    label="📥 Download as CSV (zip)",
+                    data=zip_buffer.getvalue(),
+                    file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip"
+                )
+        except Exception as e:
+            st.error(f"CSV export failed: {str(e)}")
+
+    with col3:
+        if st.button("🗑️ Clear Results"):
             st.session_state.results = []
             st.success("Results cleared!")
             st.rerun()
-        st.caption("💡 Clear after downloading if processing multiple batches")
+        st.caption("💡 Clear after downloading")
     
     st.header("📊 Results Preview")
     for (filename, sheet_name), df in results_by_sheet.items():
