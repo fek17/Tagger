@@ -2,6 +2,7 @@ import pandas as pd
 import requests
 import json
 import time
+import re
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 import openai
@@ -1519,6 +1520,26 @@ def run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries
     create_download_buttons(final_results_by_sheet)
 
 
+# Regex pattern for illegal XML characters that Excel cannot handle
+ILLEGAL_XML_CHARS_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F]')
+
+
+def sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove illegal XML characters from string columns in a DataFrame.
+
+    Excel (via openpyxl) cannot handle certain control characters that are
+    illegal in XML. This function removes them to prevent IllegalCharacterError.
+    """
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            df_clean[col] = df_clean[col].apply(
+                lambda x: ILLEGAL_XML_CHARS_RE.sub('', str(x)) if pd.notna(x) and isinstance(x, str) else x
+            )
+    return df_clean
+
+
 def create_download_buttons(results_by_sheet):
     """Create download buttons for results"""
     st.header("📥 Download Results")
@@ -1545,7 +1566,9 @@ def create_download_buttons(results_by_sheet):
                 # Only write non-empty dataframes
                 if len(tagged_df) > 0:
                     safe_sheet_name = sheet_name[:31]
-                    tagged_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+                    # Sanitize data to remove illegal XML characters before writing to Excel
+                    sanitized_df = sanitize_for_excel(tagged_df)
+                    sanitized_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
                     sheets_written += 1
                 else:
                     st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
