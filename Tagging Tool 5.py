@@ -18,6 +18,31 @@ import pickle
 from dataclasses import dataclass
 import numpy as np
 import io
+import re
+
+
+# Pattern to match illegal Excel characters (control chars except tab, newline, carriage return)
+ILLEGAL_EXCEL_CHARS_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def sanitize_for_excel(value):
+    """Remove characters that are illegal in Excel worksheets.
+
+    Excel/openpyxl doesn't allow control characters (ASCII 0-8, 11-12, 14-31).
+    This function removes them from strings to prevent IllegalCharacterError.
+    """
+    if isinstance(value, str):
+        return ILLEGAL_EXCEL_CHARS_PATTERN.sub('', value)
+    return value
+
+
+def sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """Sanitize all string columns in a DataFrame for Excel export."""
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            df_clean[col] = df_clean[col].apply(sanitize_for_excel)
+    return df_clean
 
 @dataclass
 class TaxonomyConfig:
@@ -110,13 +135,15 @@ class GenericTagger:
                 if has_data:
                     with pd.ExcelWriter(checkpoint_path_xlsx, engine='openpyxl') as writer:
                         for sheet_name, df in sheets_to_write.items():
-                            df.to_excel(writer, sheet_name=sheet_name, index=False)
+                            sanitized_df = sanitize_dataframe_for_excel(df)
+                            sanitized_df.to_excel(writer, sheet_name=sheet_name, index=False)
             else:
                 # Handle list of results
                 if results and len(results) > 0:
                     df = pd.DataFrame(results)
                     if len(df) > 0:
-                        df.to_excel(checkpoint_path_xlsx, index=False)
+                        sanitized_df = sanitize_dataframe_for_excel(df)
+                        sanitized_df.to_excel(checkpoint_path_xlsx, index=False)
                         has_data = True
             
             # Clean up old files
@@ -1545,7 +1572,8 @@ def create_download_buttons(results_by_sheet):
                 # Only write non-empty dataframes
                 if len(tagged_df) > 0:
                     safe_sheet_name = sheet_name[:31]
-                    tagged_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+                    sanitized_df = sanitize_dataframe_for_excel(tagged_df)
+                    sanitized_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
                     sheets_written += 1
                 else:
                     st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
