@@ -2,6 +2,7 @@ import pandas as pd
 import requests
 import json
 import time
+import re
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 import openai
@@ -18,6 +19,93 @@ import pickle
 from dataclasses import dataclass
 import numpy as np
 import io
+import re
+
+
+def sanitize_for_excel(value):
+    """
+    Remove illegal characters that cannot be used in Excel worksheets.
+
+    openpyxl raises IllegalCharacterError for control characters (ASCII 0-31)
+    except for tab (9), newline (10), and carriage return (13).
+    """
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        return value
+
+    # Remove illegal control characters (ASCII 0-8, 11-12, 14-31)
+    # Keep tab (9), newline (10), carriage return (13)
+    illegal_chars_pattern = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+    cleaned = illegal_chars_pattern.sub('', value)
+
+    return cleaned
+
+
+def sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitize all string columns in a DataFrame to remove illegal Excel characters.
+    Returns a copy of the DataFrame with sanitized values.
+    """
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            df_clean[col] = df_clean[col].apply(sanitize_for_excel)
+    return df_clean
+
+
+def sanitize_tag_value(value: str) -> str:
+    """
+    Sanitize tag values by removing illegal and problematic characters.
+
+    Handles:
+    - Control characters (0x00-0x1F except tab/newline which are normalized)
+    - Null bytes
+    - Zero-width characters (ZWSP, ZWNJ, ZWJ, BOM)
+    - Excessive whitespace (collapses to single space)
+    - Leading/trailing whitespace and commas
+    - Carriage returns and newlines (normalized to space)
+    - Tabs (normalized to space)
+    """
+    if not isinstance(value, str):
+        return str(value) if value is not None else ""
+
+    # Remove null bytes
+    value = value.replace('\x00', '')
+
+    # Remove zero-width characters
+    zero_width_chars = [
+        '\u200b',  # Zero-width space
+        '\u200c',  # Zero-width non-joiner
+        '\u200d',  # Zero-width joiner
+        '\ufeff',  # BOM / Zero-width no-break space
+        '\u200e',  # Left-to-right mark
+        '\u200f',  # Right-to-left mark
+        '\u2060',  # Word joiner
+        '\u2061',  # Function application
+        '\u2062',  # Invisible times
+        '\u2063',  # Invisible separator
+        '\u2064',  # Invisible plus
+    ]
+    for char in zero_width_chars:
+        value = value.replace(char, '')
+
+    # Remove control characters (0x00-0x1F) except we handle \t, \n, \r separately
+    value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', value)
+
+    # Normalize newlines, carriage returns, and tabs to spaces
+    value = value.replace('\r\n', ' ')
+    value = value.replace('\r', ' ')
+    value = value.replace('\n', ' ')
+    value = value.replace('\t', ' ')
+
+    # Collapse multiple spaces into single space
+    value = re.sub(r' +', ' ', value)
+
+    # Strip leading/trailing whitespace and trailing commas
+    value = value.strip().rstrip(',').strip()
+
+    return value
 
 @dataclass
 class TaxonomyConfig:
@@ -85,44 +173,51 @@ class GenericTagger:
         """Save checkpoint and automatically clean up old ones"""
         with self.file_lock:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
+
             # Always save pickle (can handle empty data)
             checkpoint_path_pkl = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.pkl"
             with open(checkpoint_path_pkl, 'wb') as f:
                 pickle.dump(results, f)
-            
+
             # Only create Excel if there's data to write
             checkpoint_path_xlsx = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.xlsx"
             has_data = False
-            
-            if isinstance(results, dict):
-                # Check if any job has results
-                sheets_to_write = {}
-                for key, data in results.items():
-                    if data and len(data) > 0:
-                        df = pd.DataFrame(data)
+
+            try:
+                if isinstance(results, dict):
+                    # Check if any job has results
+                    sheets_to_write = {}
+                    for key, data in results.items():
+                        if data and len(data) > 0:
+                            df = pd.DataFrame(data)
+                            if len(df) > 0:
+                                sheet_name = f"{key[0]}_{key[1]}"[:31]
+                                # Sanitize the dataframe to remove illegal characters
+                                sheets_to_write[sheet_name] = sanitize_dataframe_for_excel(df)
+                                has_data = True
+
+                    # Only create Excel file if we have data
+                    if has_data:
+                        with pd.ExcelWriter(checkpoint_path_xlsx, engine='openpyxl') as writer:
+                            for sheet_name, df in sheets_to_write.items():
+                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                else:
+                    # Handle list of results
+                    if results and len(results) > 0:
+                        df = pd.DataFrame(results)
                         if len(df) > 0:
-                            sheet_name = f"{key[0]}_{key[1]}"[:31]
-                            sheets_to_write[sheet_name] = df
+                            # Sanitize the dataframe to remove illegal characters
+                            sanitized_df = sanitize_dataframe_for_excel(df)
+                            sanitized_df.to_excel(checkpoint_path_xlsx, index=False)
                             has_data = True
-                
-                # Only create Excel file if we have data
-                if has_data:
-                    with pd.ExcelWriter(checkpoint_path_xlsx, engine='openpyxl') as writer:
-                        for sheet_name, df in sheets_to_write.items():
-                            df.to_excel(writer, sheet_name=sheet_name, index=False)
-            else:
-                # Handle list of results
-                if results and len(results) > 0:
-                    df = pd.DataFrame(results)
-                    if len(df) > 0:
-                        df.to_excel(checkpoint_path_xlsx, index=False)
-                        has_data = True
-            
+            except Exception as e:
+                # Log Excel checkpoint error but don't fail - pickle is the primary backup
+                print(f"Warning: Excel checkpoint save failed: {e}")
+
             # Clean up old files
             all_pkl_files = sorted(self.checkpoint_dir.glob("*.pkl"), key=lambda x: x.stat().st_mtime)
             all_xlsx_files = sorted(self.checkpoint_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime)
-            
+
             for old_file in all_pkl_files[:-2]:
                 try:
                     old_file.unlink()
@@ -133,7 +228,7 @@ class GenericTagger:
                     old_file.unlink()
                 except Exception:
                     pass
-            
+
             return checkpoint_path_pkl
     
     def load_checkpoint(self, checkpoint_path: str) -> List[Dict]:
@@ -379,8 +474,8 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                 
                 return {
                     'status': 'success',
-                    'primary_tag': parsed.primary_tag.strip().rstrip(','),
-                    'secondary_tags': [tag.strip().rstrip(',') for tag in parsed.secondary_tags],
+                    'primary_tag': sanitize_tag_value(parsed.primary_tag),
+                    'secondary_tags': [sanitize_tag_value(tag) for tag in parsed.secondary_tags],
                     'confidence': parsed.confidence,
                     'reasoning': parsed.reasoning
                 }
@@ -423,7 +518,7 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                 
                 return {
                     'status': 'success',
-                    'tag': parsed.selected_tag.strip().rstrip(','),
+                    'tag': sanitize_tag_value(parsed.selected_tag),
                     'confidence': parsed.confidence,
                     'reasoning': parsed.reasoning
                 }
@@ -435,35 +530,389 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
             if "refusal" in error_msg.lower():
                 return {'status': 'error', 'error': 'Model refused to respond for safety reasons'}
             return {'status': 'error', 'error': error_msg}
-    
+
+    def search_and_tag_with_openai(self, entity_name: str, entity_url: str = None,
+                                    available_tags: List[str] = None, tag_descriptions: Dict[str, str] = None,
+                                    multi_select: bool = False, existing_data: Dict = None,
+                                    custom_prompt: str = None, taxonomy_instructions: str = "",
+                                    additional_context: str = "", max_retries: int = 3,
+                                    progress_callback=None) -> Dict:
+        """
+        Combined web search and tagging using OpenAI's built-in web_search tool.
+        This performs search and classification in a single API call, eliminating
+        the need for a separate Perplexity search step.
+        """
+        if not self.openai_client:
+            return {'status': 'error', 'error': 'OpenAI client not initialized'}
+
+        def _search_and_tag():
+            context = ""
+            if existing_data:
+                context = "\n\nAdditional context from data:\n"
+                context += "\n".join([f"{k}: {v}" for k, v in existing_data.items() if v])
+
+            # Build the web search tool configuration
+            web_search_tool = {"type": "web_search"}
+
+            # Add domain filtering if URL provided
+            if entity_url:
+                clean_domain = entity_url.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+                web_search_tool["filters"] = {"allowed_domains": [clean_domain]}
+
+            # Build system prompt based on mode
+            if custom_prompt and not available_tags:
+                # Custom prompt mode (no taxonomy)
+                if multi_select:
+                    class OpenAISearchMultiOutput(BaseModel):
+                        search_summary: str
+                        primary_result: str
+                        secondary_results: List[str]
+                        confidence: float
+                        reasoning: str
+
+                    system_content = f"""You have access to web search. First, search the web for information about the entity, then analyze and classify based on the following prompt:
+
+{custom_prompt}
+
+IMPORTANT: Use web search to find current, accurate information about the entity. Focus on factual information from reliable sources.
+
+Since multiple results are allowed, provide:
+- search_summary: A brief summary (2-3 sentences) of key information found about the entity
+- primary_result: The main/most important classification or result
+- secondary_results: A list of additional relevant classifications or results (can be empty list if only one result applies)
+
+For the reasoning field, provide a brief explanation (3 sentences max) that includes:
+1. Why you chose the primary result (and secondary results if any)
+2. What specific information from your search influenced your decision
+3. How any additional context factored into your decision"""
+
+                    user_content = f"Search for and classify: {entity_name}"
+                    if additional_context:
+                        user_content += f"\n\n{additional_context}"
+                    user_content += context
+
+                    response = self.openai_client.responses.parse(
+                        model="gpt-5.2",
+                        tools=[web_search_tool],
+                        input=[
+                            {"role": "system", "content": system_content},
+                            {"role": "user", "content": user_content}
+                        ],
+                        text_format=OpenAISearchMultiOutput
+                    )
+
+                    parsed = response.output_parsed
+
+                    return {
+                        'status': 'success',
+                        'search_description': parsed.search_summary,
+                        'primary_tag': sanitize_tag_value(parsed.primary_result),
+                        'secondary_tags': [sanitize_tag_value(tag) for tag in parsed.secondary_results],
+                        'confidence': parsed.confidence,
+                        'reasoning': parsed.reasoning
+                    }
+                else:
+                    class OpenAISearchSingleOutput(BaseModel):
+                        search_summary: str
+                        result: str
+                        confidence: float
+                        reasoning: str
+
+                    system_content = f"""You have access to web search. First, search the web for information about the entity, then analyze and classify based on the following prompt:
+
+{custom_prompt}
+
+IMPORTANT: Use web search to find current, accurate information about the entity. Focus on factual information from reliable sources.
+
+Provide:
+- search_summary: A brief summary (2-3 sentences) of key information found about the entity
+- result: Your classification result
+
+For the reasoning field, provide a brief explanation (3 sentences max) that includes:
+1. Why you chose this particular classification
+2. What specific information from your search influenced your decision
+3. How any additional context factored into your decision"""
+
+                    user_content = f"Search for and classify: {entity_name}"
+                    if additional_context:
+                        user_content += f"\n\n{additional_context}"
+                    user_content += context
+
+                    response = self.openai_client.responses.parse(
+                        model="gpt-5.2",
+                        tools=[web_search_tool],
+                        input=[
+                            {"role": "system", "content": system_content},
+                            {"role": "user", "content": user_content}
+                        ],
+                        text_format=OpenAISearchSingleOutput
+                    )
+
+                    parsed = response.output_parsed
+
+                    return {
+                        'status': 'success',
+                        'search_description': parsed.search_summary,
+                        'result': sanitize_tag_value(parsed.result),
+                        'confidence': parsed.confidence,
+                        'reasoning': parsed.reasoning
+                    }
+
+            # Taxonomy mode
+            tags_desc = "\n".join([
+                f"- {tag}: {tag_descriptions.get(tag, 'No description available')}"
+                for tag in (available_tags or [])
+            ])
+
+            if multi_select:
+                class OpenAISearchTaxonomyMultiOutput(BaseModel):
+                    search_summary: str
+                    primary_tag: str
+                    secondary_tags: List[str]
+                    confidence: float
+                    reasoning: str
+
+                system_content = f"""You have access to web search. First, search the web for information about the entity, then classify it using the taxonomy below.
+
+Select multiple tags if appropriate, with one primary and optional secondary tags.
+
+IMPORTANT: Use web search to find current, accurate information about the entity. Focus on factual information from reliable sources.
+
+Available tags:
+{tags_desc}
+
+Ensure your primary_tag and all secondary_tags are from the available tags list above.
+
+Provide:
+- search_summary: A brief summary (2-3 sentences) of key information found about the entity
+- primary_tag: The most appropriate tag from the taxonomy
+- secondary_tags: Additional relevant tags (can be empty)
+
+For the reasoning field, provide a brief explanation (3 sentences max) that includes:
+1. Why you chose the specific primary tag (and secondary tags if any)
+2. What key information from your search influenced your decision
+3. How any additional context data factored into your classification"""
+
+                if taxonomy_instructions:
+                    system_content += f"\n\nADDITIONAL CUSTOM INSTRUCTIONS:\n{taxonomy_instructions}\n\nPlease follow these custom instructions while still selecting from the available taxonomy tags."
+
+                user_content = f"Search for and classify: {entity_name}"
+                if additional_context:
+                    user_content += f"\n\n{additional_context}"
+                user_content += context
+
+                response = self.openai_client.responses.parse(
+                    model="gpt-5.2",
+                    tools=[web_search_tool],
+                    input=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content}
+                    ],
+                    text_format=OpenAISearchTaxonomyMultiOutput
+                )
+
+                parsed = response.output_parsed
+
+                return {
+                    'status': 'success',
+                    'search_description': parsed.search_summary,
+                    'primary_tag': sanitize_tag_value(parsed.primary_tag),
+                    'secondary_tags': [sanitize_tag_value(tag) for tag in parsed.secondary_tags],
+                    'confidence': parsed.confidence,
+                    'reasoning': parsed.reasoning
+                }
+            else:
+                class OpenAISearchTaxonomySingleOutput(BaseModel):
+                    search_summary: str
+                    selected_tag: str
+                    confidence: float
+                    reasoning: str
+
+                system_content = f"""You have access to web search. First, search the web for information about the entity, then classify it using the taxonomy below.
+
+Select the single most appropriate tag.
+
+IMPORTANT: Use web search to find current, accurate information about the entity. Focus on factual information from reliable sources.
+
+Available tags:
+{tags_desc}
+
+Ensure your selected_tag is from the available tags list above.
+
+Provide:
+- search_summary: A brief summary (2-3 sentences) of key information found about the entity
+- selected_tag: The most appropriate tag from the taxonomy
+
+For the reasoning field, provide a brief explanation (3 sentences max) that includes:
+1. Why you chose this specific tag over others
+2. What key information from your search influenced your decision
+3. How any additional context data factored into your classification"""
+
+                if taxonomy_instructions:
+                    system_content += f"\n\nADDITIONAL CUSTOM INSTRUCTIONS:\n{taxonomy_instructions}\n\nPlease follow these custom instructions while still selecting from the available taxonomy tags."
+
+                user_content = f"Search for and classify: {entity_name}"
+                if additional_context:
+                    user_content += f"\n\n{additional_context}"
+                user_content += context
+
+                response = self.openai_client.responses.parse(
+                    model="gpt-5.2",
+                    tools=[web_search_tool],
+                    input=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content}
+                    ],
+                    text_format=OpenAISearchTaxonomySingleOutput
+                )
+
+                parsed = response.output_parsed
+
+                return {
+                    'status': 'success',
+                    'search_description': parsed.search_summary,
+                    'tag': sanitize_tag_value(parsed.selected_tag),
+                    'confidence': parsed.confidence,
+                    'reasoning': parsed.reasoning
+                }
+
+        try:
+            return self.retry_with_exponential_backoff(
+                _search_and_tag,
+                max_retries=max_retries,
+                entity_name=entity_name,
+                progress_callback=progress_callback
+            )
+        except Exception as e:
+            error_msg = str(e)
+            if "refusal" in error_msg.lower():
+                return {'status': 'error', 'error': 'Model refused to respond for safety reasons'}
+            return {'status': 'error', 'error': error_msg}
+
     def process_single_entity(self, row_data: Dict, config: Dict, progress_callback=None) -> Dict:
-        """Process a single entity based on configuration"""
+        """Process a single entity based on configuration
+
+        Supports two search providers:
+        - 'perplexity': Uses Perplexity API for search, then OpenAI for tagging (2 API calls)
+        - 'openai': Uses OpenAI's built-in web_search tool for combined search+tag (1 API call)
+        """
         try:
             entity_name = row_data.get(config['name_column'], 'Unknown')
-            
+
             context_columns = config.get('context_columns', [])
             context_data = {col: row_data.get(col) for col in context_columns if col in row_data}
-            
+
             taxonomy_instructions = ""
             if config.get('use_taxonomy', True):
                 taxonomy_instructions = config.get('taxonomy_custom_instructions', '')
-            
+
             context_parts = [f"{k}: {v}" for k, v in context_data.items() if v]
             additional_context = ""
             if context_parts:
                 additional_context = "Additional context:\n" + "\n".join(context_parts)
-            
+
             custom_prompt = config.get('custom_prompt', None)
-            
+            search_provider = config.get('search_provider', 'perplexity')
+
+            # Get taxonomy info (needed for both search paths)
+            use_taxonomy = config.get('use_taxonomy', True)
+            taxonomy = config.get('taxonomy')
+
+            if use_taxonomy and taxonomy:
+                if config.get('category_column') and taxonomy.categories:
+                    category = row_data.get(config['category_column'], 'default')
+                    available_tags = taxonomy.categories.get(category,
+                                                                taxonomy.categories.get('default', []))
+                else:
+                    all_tags = []
+                    for tags in taxonomy.categories.values():
+                        all_tags.extend(tags)
+                    available_tags = list(set(all_tags))
+
+                tag_descriptions = taxonomy.descriptions
+            else:
+                available_tags = []
+                tag_descriptions = {}
+
+            # OpenAI combined search+tag path (single API call)
+            if config['use_search'] and search_provider == 'openai':
+                url_column = config.get('url_column')
+                entity_url = row_data.get(url_column) if url_column else None
+                max_retries = config.get('search_max_retries', 3)
+
+                tag_result = self.search_and_tag_with_openai(
+                    entity_name=entity_name,
+                    entity_url=entity_url,
+                    available_tags=available_tags if use_taxonomy else None,
+                    tag_descriptions=tag_descriptions if use_taxonomy else None,
+                    multi_select=config.get('multi_select', False),
+                    existing_data=context_data,
+                    custom_prompt=custom_prompt,
+                    taxonomy_instructions=taxonomy_instructions,
+                    additional_context=additional_context,
+                    max_retries=max_retries,
+                    progress_callback=progress_callback
+                )
+
+                result = row_data.copy()
+
+                if tag_result['status'] == 'error':
+                    result.update({
+                        'Search_Description': tag_result.get('error', 'Unknown error'),
+                        'Tagged_Result': 'Error',
+                        'Confidence': '0%',
+                        'Reasoning': tag_result['error'],
+                        'Status': 'Error'
+                    })
+                else:
+                    # Add search description from OpenAI's web search
+                    if 'search_description' in tag_result:
+                        result['Search_Description'] = tag_result['search_description'][:500]
+
+                    if 'result' in tag_result:
+                        result.update({
+                            'Tagged_Result': tag_result['result'],
+                            'Confidence': f"{tag_result['confidence']:.0%}",
+                            'Reasoning': tag_result['reasoning'],
+                            'Status': 'Success'
+                        })
+                    elif config.get('multi_select'):
+                        secondary_tags = tag_result.get('secondary_tags', [])
+                        if isinstance(secondary_tags, list):
+                            secondary_tags_str = '; '.join(secondary_tags) if secondary_tags else ''
+                        else:
+                            secondary_tags_str = str(secondary_tags)
+
+                        result.update({
+                            'Primary_Tag': tag_result['primary_tag'],
+                            'Secondary_Tags': secondary_tags_str,
+                            'Confidence': f"{tag_result['confidence']:.0%}",
+                            'Reasoning': tag_result['reasoning'],
+                            'Status': 'Success'
+                        })
+                    else:
+                        tag_value = tag_result.get('tag', '')
+                        tag_value = sanitize_tag_value(tag_value)
+
+                        result.update({
+                            'Tagged_Result': tag_value,
+                            'Confidence': f"{tag_result['confidence']:.0%}",
+                            'Reasoning': tag_result['reasoning'],
+                            'Status': 'Success'
+                        })
+
+                return result
+
+            # Perplexity search + OpenAI tag path (original 2-step process)
             search_success = True
             if config['use_search'] and self.perplexity_api_key:
                 url_column = config.get('url_column')
                 entity_url = row_data.get(url_column) if url_column else None
-                
+
                 max_retries = config.get('search_max_retries', 3)
-                
+
                 description, search_success = self.search_entity_info(
-                    entity_name, 
+                    entity_name,
                     entity_url,
                     additional_context=additional_context,
                     max_retries=max_retries,
@@ -472,7 +921,7 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                     include_sources=True,
                     taxonomy_instructions=taxonomy_instructions
                 )
-                
+
                 if not search_success:
                     result = row_data.copy()
                     result.update({
@@ -490,29 +939,7 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                     if col in row_data and row_data[col]:
                         description_parts.append(f"{col}: {row_data[col]}")
                 description = "\n".join(description_parts) if description_parts else f"No description available for {entity_name}"
-            
-            use_taxonomy = config.get('use_taxonomy', True)
-            custom_prompt = config.get('custom_prompt', None)
-            
-            # Get taxonomy from config instead of self.taxonomy
-            taxonomy = config.get('taxonomy')
-            
-            if use_taxonomy and taxonomy:
-                if config.get('category_column') and taxonomy.categories:
-                    category = row_data.get(config['category_column'], 'default')
-                    available_tags = taxonomy.categories.get(category, 
-                                                                taxonomy.categories.get('default', []))
-                else:
-                    all_tags = []
-                    for tags in taxonomy.categories.values():
-                        all_tags.extend(tags)
-                    available_tags = list(set(all_tags))
-                
-                tag_descriptions = taxonomy.descriptions
-            else:
-                available_tags = []
-                tag_descriptions = {}
-            
+
             tag_result = self.select_tags_with_ai(
                 description=description,
                 entity_name=entity_name,
@@ -523,12 +950,12 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                 custom_prompt=custom_prompt,
                 taxonomy_instructions=taxonomy_instructions
             )
-            
+
             result = row_data.copy()
-            
+
             if config['use_search']:
                 result['Search_Description'] = description[:500]
-            
+
             if tag_result['status'] == 'error':
                 result.update({
                     'Tagged_Result': 'Error',
@@ -550,7 +977,7 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                         secondary_tags_str = '; '.join(secondary_tags) if secondary_tags else ''
                     else:
                         secondary_tags_str = str(secondary_tags)
-                    
+
                     result.update({
                         'Primary_Tag': tag_result['primary_tag'],
                         'Secondary_Tags': secondary_tags_str,
@@ -560,18 +987,17 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
                     })
                 else:
                     tag_value = tag_result.get('tag', '')
-                    if isinstance(tag_value, str):
-                        tag_value = tag_value.strip().rstrip(',')
-                    
+                    tag_value = sanitize_tag_value(tag_value)
+
                     result.update({
                         'Tagged_Result': tag_value,
                         'Confidence': f"{tag_result['confidence']:.0%}",
                         'Reasoning': tag_result['reasoning'],
                         'Status': 'Success'
                     })
-            
+
             return result
-            
+
         except Exception as e:
             result = row_data.copy()
             result.update({
@@ -714,28 +1140,42 @@ def initialize_session_state():
 def create_column_config(df, sheet_key):
     """Create column configuration UI for a single sheet"""
     columns = df.columns.tolist()
-    
+
     use_search = st.checkbox(
-        "Use web search (Perplexity)", 
+        "Use web search",
         value=False,
         key=f"use_search_{sheet_key}"
     )
-    
+
+    search_provider = 'perplexity'  # default
+    if use_search:
+        search_provider = st.radio(
+            "Search provider",
+            options=['perplexity', 'openai'],
+            format_func=lambda x: {
+                'perplexity': 'Perplexity (separate search, then tag)',
+                'openai': 'OpenAI Web Search (combined search + tag in one step)'
+            }[x],
+            key=f"search_provider_{sheet_key}",
+            help="**Perplexity**: Uses Perplexity API for search, then OpenAI for tagging (2 API calls). Requires Perplexity API key.\n\n**OpenAI**: Uses OpenAI's built-in web search tool for combined search and tagging in a single API call. No Perplexity key needed."
+        )
+
     name_column = st.selectbox(
-        "Entity name column", 
+        "Entity name column",
         columns,
         help="Column containing the names to tag",
         key=f"name_col_{sheet_key}"
     )
-    
+
     url_column = None
     description_columns = []
-    
+
     if use_search:
         url_column = st.selectbox(
-            "URL column (optional)", 
+            "URL column (optional)",
             ['None'] + columns,
-            key=f"url_col_{sheet_key}"
+            key=f"url_col_{sheet_key}",
+            help="If provided, search will be filtered to this domain"
         )
         url_column = None if url_column == 'None' else url_column
     else:
@@ -745,14 +1185,14 @@ def create_column_config(df, sheet_key):
             help="Columns containing descriptions",
             key=f"desc_cols_{sheet_key}"
         )
-    
+
     context_columns = st.multiselect(
         "Context columns (optional)",
         [c for c in columns if c != name_column],
         help="Additional context for tagging",
         key=f"context_cols_{sheet_key}"
     )
-    
+
     category_column = st.selectbox(
         "Category column (optional)",
         ['None'] + columns,
@@ -760,10 +1200,11 @@ def create_column_config(df, sheet_key):
         key=f"category_col_{sheet_key}"
     )
     category_column = None if category_column == 'None' else category_column
-    
+
     return {
         'name_column': name_column,
         'use_search': use_search,
+        'search_provider': search_provider,
         'url_column': url_column,
         'description_columns': description_columns,
         'context_columns': context_columns,
@@ -1522,50 +1963,97 @@ def run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries
 def create_download_buttons(results_by_sheet):
     """Create download buttons for results"""
     st.header("📥 Download Results")
-    
-    col1, col2 = st.columns([2, 1])
-    
+
+    # Prepare tagged dataframes for all sheets
+    prepared_dfs = {}
+    for (filename, sheet_name), df in results_by_sheet.items():
+        if 'Status' in df.columns:
+            tagged_df = df[df['Status'].notna()].copy()
+        else:
+            result_cols = [col for col in df.columns if any(
+                keyword in col for keyword in ['Tagged_Result', 'Primary_Tag', 'Confidence', 'Status']
+            )]
+            if result_cols:
+                mask = df[result_cols].notna().any(axis=1)
+                tagged_df = df[mask].copy()
+            else:
+                tagged_df = df.copy()
+
+        if len(tagged_df) > 0:
+            prepared_dfs[(filename, sheet_name)] = tagged_df
+        else:
+            st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
+
+    if not prepared_dfs:
+        st.error("No results available to download. All sheets are empty.")
+        return
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+
+    # Excel download with error handling
     with col1:
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            sheets_written = 0
-            for (filename, sheet_name), df in results_by_sheet.items():
-                if 'Status' in df.columns:
-                    tagged_df = df[df['Status'].notna()].copy()
-                else:
-                    result_cols = [col for col in df.columns if any(
-                        keyword in col for keyword in ['Tagged_Result', 'Primary_Tag', 'Confidence', 'Status']
-                    )]
-                    if result_cols:
-                        mask = df[result_cols].notna().any(axis=1)
-                        tagged_df = df[mask].copy()
-                    else:
-                        tagged_df = df.copy()
-                
-                # Only write non-empty dataframes
-                if len(tagged_df) > 0:
+        excel_error = None
+        try:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                for (filename, sheet_name), tagged_df in prepared_dfs.items():
                     safe_sheet_name = sheet_name[:31]
-                    tagged_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
-                    sheets_written += 1
-                else:
-                    st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
-        
-        if sheets_written > 0:
+                    # Sanitize the dataframe to remove illegal characters
+                    sanitized_df = sanitize_dataframe_for_excel(tagged_df)
+                    sanitized_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
             st.download_button(
                 label="📥 Download All Results (Excel)",
                 data=output.getvalue(),
                 file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.error("No results available to download. All sheets are empty.")
-    
+        except Exception as e:
+            excel_error = str(e)
+            st.error(f"⚠️ Excel export failed: {excel_error}")
+            st.info("Please use the CSV download option instead.")
+
+    # CSV download as alternative/fallback
     with col2:
-        if st.button("🗑️ Clear Results from Memory"):
+        try:
+            # For multiple sheets, create a zip file with CSVs
+            if len(prepared_dfs) == 1:
+                # Single sheet - direct CSV download
+                (filename, sheet_name), tagged_df = list(prepared_dfs.items())[0]
+                csv_output = io.StringIO()
+                tagged_df.to_csv(csv_output, index=False)
+                st.download_button(
+                    label="📥 Download as CSV",
+                    data=csv_output.getvalue(),
+                    file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+            else:
+                # Multiple sheets - create zip with multiple CSVs
+                import zipfile
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    for (filename, sheet_name), tagged_df in prepared_dfs.items():
+                        csv_output = io.StringIO()
+                        tagged_df.to_csv(csv_output, index=False)
+                        safe_name = sheet_name[:31].replace('/', '_').replace('\\', '_')
+                        zip_file.writestr(f"{safe_name}.csv", csv_output.getvalue())
+
+                st.download_button(
+                    label="📥 Download as CSV (zip)",
+                    data=zip_buffer.getvalue(),
+                    file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip"
+                )
+        except Exception as e:
+            st.error(f"CSV export failed: {str(e)}")
+
+    with col3:
+        if st.button("🗑️ Clear Results"):
             st.session_state.results = []
             st.success("Results cleared!")
             st.rerun()
-        st.caption("💡 Clear after downloading if processing multiple batches")
+        st.caption("💡 Clear after downloading")
     
     st.header("📊 Results Preview")
     for (filename, sheet_name), df in results_by_sheet.items():
@@ -1707,7 +2195,7 @@ def create_streamlit_app():
     with st.expander("📚 Quick Start Guide (4 steps)", expanded=False):
         st.markdown("""
         ### 1. **Initialize** in the sidebar
-        Enter API keys. Enter Perplexity key only if using Web Search.
+        Enter API keys. Perplexity key only needed if using Perplexity search (not needed for OpenAI search).
         
         ### 2. **Upload input data and map columns**
         - Upload one or more Excel/CSV files
@@ -1732,7 +2220,7 @@ def create_streamlit_app():
             openai_key = st.text_input("OpenAI API Key", type="password", 
                                       help="Required for AI tagging")
             perplexity_key = st.text_input("Perplexity API Key", type="password",
-                                         help="Optional - only needed if using web search")
+                                         help="Optional - only needed if using Perplexity as search provider. Not required for OpenAI web search.")
             
             st.markdown("---")
             checkpoint_path = st.text_input(
