@@ -905,7 +905,18 @@ For the reasoning field, provide a brief explanation (3 sentences max) that incl
 
             # Perplexity search + OpenAI tag path (original 2-step process)
             search_success = True
-            if config['use_search'] and self.perplexity_api_key:
+            if config['use_search'] and search_provider == 'perplexity':
+                # Check if Perplexity API key is available
+                if not self.perplexity_api_key:
+                    result = row_data.copy()
+                    result.update({
+                        'Search_Description': 'Perplexity API key not provided',
+                        'Tagged_Result': 'Configuration Error',
+                        'Confidence': '0%',
+                        'Reasoning': 'Perplexity search provider selected but no Perplexity API key was provided. Please add your Perplexity API key in the sidebar or switch to OpenAI search provider.',
+                        'Status': 'Config Error'
+                    })
+                    return result
                 url_column = config.get('url_column')
                 entity_url = row_data.get(url_column) if url_column else None
 
