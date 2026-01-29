@@ -170,60 +170,53 @@ class GenericTagger:
         return TaxonomyConfig(categories=categories, descriptions=descriptions)
     
     def save_checkpoint(self, results: List[Dict], checkpoint_name: str):
-        """Save checkpoint and automatically clean up old ones"""
+        """Save checkpoint as both pickle and CSV files, and clean up old ones"""
         with self.file_lock:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-            # Always save pickle (can handle empty data)
+            # Always save pickle (can handle empty data and preserves all data types)
             checkpoint_path_pkl = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.pkl"
             with open(checkpoint_path_pkl, 'wb') as f:
                 pickle.dump(results, f)
 
-            # Only create Excel if there's data to write
-            checkpoint_path_xlsx = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.xlsx"
-            has_data = False
-
+            # Save CSV checkpoint (more accessible than Excel, no character issues)
             try:
                 if isinstance(results, dict):
-                    # Check if any job has results
-                    sheets_to_write = {}
+                    # Multiple jobs - save each as separate CSV or combine
+                    all_rows = []
                     for key, data in results.items():
                         if data and len(data) > 0:
-                            df = pd.DataFrame(data)
-                            if len(df) > 0:
-                                sheet_name = f"{key[0]}_{key[1]}"[:31]
-                                # Sanitize the dataframe to remove illegal characters
-                                sheets_to_write[sheet_name] = sanitize_dataframe_for_excel(df)
-                                has_data = True
+                            for row in data:
+                                row_copy = row.copy()
+                                row_copy['_source_file'] = key[0] if isinstance(key, tuple) else str(key)
+                                row_copy['_source_sheet'] = key[1] if isinstance(key, tuple) and len(key) > 1 else ''
+                                all_rows.append(row_copy)
 
-                    # Only create Excel file if we have data
-                    if has_data:
-                        with pd.ExcelWriter(checkpoint_path_xlsx, engine='openpyxl') as writer:
-                            for sheet_name, df in sheets_to_write.items():
-                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    if all_rows:
+                        df = pd.DataFrame(all_rows)
+                        checkpoint_path_csv = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.csv"
+                        df.to_csv(checkpoint_path_csv, index=False)
                 else:
                     # Handle list of results
                     if results and len(results) > 0:
                         df = pd.DataFrame(results)
                         if len(df) > 0:
-                            # Sanitize the dataframe to remove illegal characters
-                            sanitized_df = sanitize_dataframe_for_excel(df)
-                            sanitized_df.to_excel(checkpoint_path_xlsx, index=False)
-                            has_data = True
+                            checkpoint_path_csv = self.checkpoint_dir / f"{checkpoint_name}_{timestamp}.csv"
+                            df.to_csv(checkpoint_path_csv, index=False)
             except Exception as e:
-                # Log Excel checkpoint error but don't fail - pickle is the primary backup
-                print(f"Warning: Excel checkpoint save failed: {e}")
+                # Log CSV checkpoint error but don't fail - pickle is the primary backup
+                print(f"Warning: CSV checkpoint save failed: {e}")
 
-            # Clean up old files
+            # Clean up old files (keep last 2 of each type)
             all_pkl_files = sorted(self.checkpoint_dir.glob("*.pkl"), key=lambda x: x.stat().st_mtime)
-            all_xlsx_files = sorted(self.checkpoint_dir.glob("*.xlsx"), key=lambda x: x.stat().st_mtime)
+            all_csv_files = sorted(self.checkpoint_dir.glob("*.csv"), key=lambda x: x.stat().st_mtime)
 
             for old_file in all_pkl_files[:-2]:
                 try:
                     old_file.unlink()
                 except Exception:
                     pass
-            for old_file in all_xlsx_files[:-2]:
+            for old_file in all_csv_files[:-2]:
                 try:
                     old_file.unlink()
                 except Exception:
@@ -2288,7 +2281,7 @@ def create_streamlit_app():
                     if st.button("Clear All Checkpoints"):
                         for f in checkpoint_pkl_files:
                             f.unlink()
-                        for f in checkpoint_dir.glob("*.xlsx"):
+                        for f in checkpoint_dir.glob("*.csv"):
                             f.unlink()
                         st.success("All checkpoints cleared")
                         st.rerun()
