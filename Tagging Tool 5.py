@@ -1838,12 +1838,16 @@ def retry_failed_rows(tagging_jobs, failed_info, max_workers, batch_size, search
             try:
                 result = future.result()
 
-                # Update the existing results
-                for key, value in result.items():
-                    if key not in task['job']['df'].columns:
-                        col_name = f"{key}{suffix}"
-                        if col_name in results_by_sheet[sheet_key].columns:
-                            results_by_sheet[sheet_key].loc[idx, col_name] = value
+                # Update only the columns for THIS config (using suffix)
+                # Keys like 'Status', 'Tagged_Result' become 'Status_2', 'Tagged_Result_2' for config 2
+                result_keys = ['Status', 'Tagged_Result', 'Primary_Tag', 'Secondary_Tags',
+                              'Confidence', 'Reasoning', 'Search_Description']
+
+                for key in result_keys:
+                    if key in result:
+                        col_name = f"{key}{suffix}" if suffix else key
+                        # Update if column exists, or create it
+                        results_by_sheet[sheet_key].loc[idx, col_name] = result[key]
 
                 completed += 1
                 progress = min(completed / total_tasks, 1.0)
