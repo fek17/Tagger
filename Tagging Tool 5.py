@@ -1046,83 +1046,6 @@ PRESET_PROMPTS = {
 }
 
 
-def create_tag_categories_helper(key_suffix=""):
-    """Create the 'Select this if...' helper text and popup functionality"""
-    popup_key = f"show_categories_popup_{key_suffix}"
-    if popup_key not in st.session_state:
-        st.session_state[popup_key] = False
-    
-    if st.button("*Select this if...*", key=f"categories_help_{key_suffix}", 
-                help="Click for explanation of tag categories",
-                type="secondary"):
-        st.session_state[popup_key] = True
-    
-    if st.session_state[popup_key]:
-        with st.expander("Tag Categories Explanation", expanded=True):
-            col1, col2 = st.columns([10, 1])
-            with col2:
-                if st.button("✕", key=f"close_popup_{key_suffix}", help="Close"):
-                    st.session_state[popup_key] = False
-                    st.rerun()
-            
-            with col1:
-                st.markdown("""
-                <div style="font-size: 16px; color: #333; margin-bottom: 15px;">
-                Select this if your tags are grouped by category. Each entity will be restricted to the tags in its category. E.g.
-                </div>
-                """, unsafe_allow_html=True)
-                
-                categorized_data = {
-                    "Category": ["Technology", "Technology", "Healthcare", "Healthcare", "Finance", "Finance"],
-                    "Tag": ["Software", "Hardware", "Pharmaceutical", "Medical Devices", "Banking", "Fintech"],
-                    "Description": [
-                        "Companies that develop software products",
-                        "Companies that manufacture hardware", 
-                        "Drug development and manufacturing",
-                        "Medical equipment manufacturers",
-                        "Traditional banking services",
-                        "Financial technology companies"
-                    ]
-                }
-                categorized_df = pd.DataFrame(categorized_data)
-                
-                st.markdown("""
-                <style>
-                .small-table table {
-                    font-size: 12px !important;
-                }
-                .small-table td, .small-table th {
-                    font-size: 12px !important;
-                    padding: 4px 8px !important;
-                }
-                </style>
-                """, unsafe_allow_html=True)
-                
-                st.markdown('<div class="small-table">', unsafe_allow_html=True)
-                st.table(categorized_df)
-                st.markdown('</div>', unsafe_allow_html=True)
-                
-                st.markdown("""
-                <div style="font-size: 16px; color: #333; margin: 15px 0;">
-                As opposed to the simpler:
-                </div>
-                """, unsafe_allow_html=True)
-                
-                simple_data = {
-                    "Tag": ["Software", "Hardware", "Consulting"],
-                    "Description": [
-                        "Companies that develop software",
-                        "Companies that manufacture hardware",
-                        "Professional services companies"
-                    ]
-                }
-                simple_df = pd.DataFrame(simple_data)
-                
-                st.markdown('<div class="small-table">', unsafe_allow_html=True)
-                st.table(simple_df)
-                st.markdown('</div>', unsafe_allow_html=True)
-
-
 def initialize_session_state():
     """Initialize all session state variables"""
     if 'tagger' not in st.session_state:
@@ -1142,68 +1065,87 @@ def initialize_session_state():
 
 
 def create_column_config(df, sheet_key):
-    """Create column configuration UI for a single sheet"""
+    """Create column configuration UI for a single sheet with smart defaults"""
     columns = df.columns.tolist()
 
-    use_search = st.checkbox(
-        "Use web search",
-        value=False,
-        key=f"use_search_{sheet_key}"
-    )
+    # Auto-detect common column patterns
+    auto_name = auto_detect_column(columns, ['name', 'company', 'entity', 'title', 'organization'])
+    auto_url = auto_detect_column(columns, ['url', 'website', 'link', 'domain', 'site'])
+    auto_desc = auto_detect_column(columns, ['description', 'desc', 'about', 'summary', 'overview'])
+    auto_category = auto_detect_column(columns, ['category', 'type', 'segment', 'group', 'class'])
 
-    search_provider = 'perplexity'  # default
-    if use_search:
-        search_provider = st.radio(
-            "Search provider",
-            options=['perplexity', 'openai'],
-            format_func=lambda x: {
-                'perplexity': 'Perplexity (separate search, then tag)',
-                'openai': 'OpenAI Web Search (combined search + tag in one step)'
-            }[x],
-            key=f"search_provider_{sheet_key}",
-            help="**Perplexity**: Uses Perplexity API for search, then OpenAI for tagging (2 API calls). Requires Perplexity API key.\n\n**OpenAI**: Uses OpenAI's built-in web search tool for combined search and tagging in a single API call. No Perplexity key needed."
-        )
-
+    # Entity name column (required) - default to auto-detected or first column
+    default_name_idx = columns.index(auto_name) if auto_name else 0
     name_column = st.selectbox(
         "Entity name column",
         columns,
-        help="Column containing the names to tag",
+        index=default_name_idx,
         key=f"name_col_{sheet_key}"
     )
 
+    # Web search toggle with OpenAI as default provider
+    use_search = st.checkbox(
+        "Use web search to gather information",
+        value=False,
+        key=f"use_search_{sheet_key}",
+        help="Search the web for each entity before tagging"
+    )
+
+    search_provider = 'openai'  # Default to OpenAI (simpler, one API call)
     url_column = None
     description_columns = []
 
     if use_search:
-        url_column = st.selectbox(
-            "URL column (optional)",
-            ['None'] + columns,
-            key=f"url_col_{sheet_key}",
-            help="If provided, search will be filtered to this domain"
-        )
-        url_column = None if url_column == 'None' else url_column
+        # Show provider choice in expander for advanced users
+        with st.expander("Search options", expanded=False):
+            search_provider = st.radio(
+                "Search provider",
+                options=['openai', 'perplexity'],
+                format_func=lambda x: 'OpenAI (recommended)' if x == 'openai' else 'Perplexity',
+                key=f"search_provider_{sheet_key}",
+                horizontal=True
+            )
+            if search_provider == 'perplexity':
+                st.caption("Requires Perplexity API key")
+
+            # URL column for domain filtering
+            default_url_idx = columns.index(auto_url) + 1 if auto_url else 0
+            url_column = st.selectbox(
+                "URL column (for domain filtering)",
+                ['None'] + columns,
+                index=default_url_idx,
+                key=f"url_col_{sheet_key}"
+            )
+            url_column = None if url_column == 'None' else url_column
     else:
+        # Description columns when not using search
+        default_desc = [auto_desc] if auto_desc else []
         description_columns = st.multiselect(
             "Description columns",
             columns,
-            help="Columns containing descriptions",
-            key=f"desc_cols_{sheet_key}"
+            default=default_desc,
+            key=f"desc_cols_{sheet_key}",
+            help="Columns with information about each entity"
         )
 
-    context_columns = st.multiselect(
-        "Context columns (optional)",
-        [c for c in columns if c != name_column],
-        help="Additional context for tagging",
-        key=f"context_cols_{sheet_key}"
-    )
+    # Optional columns in expander
+    with st.expander("Additional options", expanded=False):
+        context_columns = st.multiselect(
+            "Context columns",
+            [c for c in columns if c != name_column],
+            key=f"context_cols_{sheet_key}",
+            help="Extra columns to provide context"
+        )
 
-    category_column = st.selectbox(
-        "Category column (optional)",
-        ['None'] + columns,
-        help="If your taxonomy has categories",
-        key=f"category_col_{sheet_key}"
-    )
-    category_column = None if category_column == 'None' else category_column
+        default_cat_idx = columns.index(auto_category) + 1 if auto_category else 0
+        category_column = st.selectbox(
+            "Category column",
+            ['None'] + columns,
+            index=default_cat_idx,
+            key=f"category_col_{sheet_key}",
+            help="For category-based taxonomy filtering"
+        )
+        category_column = None if category_column == 'None' else category_column
 
     return {
         'name_column': name_column,
@@ -1217,458 +1159,291 @@ def create_column_config(df, sheet_key):
     }
 
 
+def auto_detect_column(columns, patterns):
+    """Auto-detect column based on common naming patterns"""
+    columns_lower = [c.lower() for c in columns]
+    for pattern in patterns:
+        for i, col_lower in enumerate(columns_lower):
+            if pattern in col_lower:
+                return columns[i]
+    return None
+
+
 def create_data_input_tab():
-    """Create the Data Input tab with multi-file/sheet support
-    
-    Note: This function handles cleanup of removed sheets:
-    - When files are removed/cleared, all associated configs are deleted
-    - When sheets are deselected, their configs are removed from tagging_configs and sheet_configs
-    """
-    st.header("📁 Data Input")
-    
-    st.markdown("""
-    <div style="font-size: 16px; color: #333; margin-bottom: 20px;">
-    <strong>Input one Excel file containing your entities to be tagged (and any other additional columns of information). Each sheet of input data should be formatted with column titles starting in cell A1. Input multiple Excel files or select multiple sheets if you want to tag more than one set of data at once.</strong>
-    <br><br>
-    The tool will output your original sheet with an added column containing tags (will add multiple columns containing tags if you set up and run multiple tags at once).
-    <br><br>
-    <strong>Data Input columns:</strong>
-    <ul>
-        <li><strong>Entity to be tagged</strong> (required)</li>
-        <li><strong>'Description' column:</strong> Only applicable if not using Web Search</li>
-        <li><strong>'URL' column:</strong> Optional, only applicable if using Web Search</li>
-        <li><strong>'Context' column(s):</strong> Optional, extra fields that help improve search and tagging</li>
-        <li><strong>Category column:</strong> Only if using tag categories</li>
-    </ul>
-    </div>
-    """, unsafe_allow_html=True)
-    
+    """Create the Data Input tab with multi-file/sheet support"""
+    st.header("Data Input")
+
+    st.caption("Upload your data file with entities to tag. The tool adds result columns to your data.")
+
     uploaded_files = st.file_uploader(
-        "Upload Excel/CSV file(s)", 
+        "Upload file(s)",
         type=['xlsx', 'xls', 'csv'],
         accept_multiple_files=True,
-        key="file_uploader"
+        key="file_uploader",
+        label_visibility="collapsed"
     )
     
     if not uploaded_files:
-        # Clear all data if no files uploaded
         if st.session_state.sheet_data or st.session_state.sheet_configs or st.session_state.tagging_configs:
             st.session_state.sheet_data = {}
             st.session_state.sheet_configs = {}
             st.session_state.tagging_configs = {}
-            st.info("All data cleared. Please upload files to continue.")
         return
-    
-    if uploaded_files:
-        st.session_state.uploaded_files = {f.name: f for f in uploaded_files}
-        
-        file_sheet_options = {}
-        for filename, file in st.session_state.uploaded_files.items():
+
+    st.session_state.uploaded_files = {f.name: f for f in uploaded_files}
+
+    file_sheet_options = {}
+    for filename, file in st.session_state.uploaded_files.items():
+        if filename.endswith('.csv'):
+            file_sheet_options[filename] = ['main']
+        else:
+            excel_file = pd.ExcelFile(file)
+            file_sheet_options[filename] = excel_file.sheet_names
+
+    # Sheet selection - only show if multiple sheets exist
+    selected_sheets = {}
+    has_multi_sheet = any(len(sheets) > 1 for sheets in file_sheet_options.values())
+
+    if has_multi_sheet:
+        st.subheader("Select Sheets")
+
+    for filename, sheets in file_sheet_options.items():
+        if len(sheets) == 1:
+            selected_sheets[filename] = sheets
+        else:
+            selected = st.multiselect(
+                f"{filename}",
+                sheets,
+                default=sheets[:1],
+                key=f"sheet_select_{filename}"
+            )
+            if selected:
+                selected_sheets[filename] = selected
+
+    total_sheets = sum(len(sheets) for sheets in selected_sheets.values())
+
+    if total_sheets == 0:
+        st.warning("Select at least one sheet to proceed.")
+        return
+
+    # Build sheet data
+    st.session_state.sheet_data = {}
+
+    for filename, sheets in selected_sheets.items():
+        file = st.session_state.uploaded_files[filename]
+        for sheet_name in sheets:
+            key = (filename, sheet_name)
+
             if filename.endswith('.csv'):
-                file_sheet_options[filename] = ['main']
+                df = pd.read_csv(file)
             else:
-                excel_file = pd.ExcelFile(file)
-                file_sheet_options[filename] = excel_file.sheet_names
-        
-        st.subheader("Select Sheet(s)")
-        selected_sheets = {}
-        
-        for filename, sheets in file_sheet_options.items():
-            if len(sheets) == 1:
-                selected_sheets[filename] = sheets
-                st.info(f"📄 **{filename}**: {sheets[0]} (auto-selected)")
-            else:
-                selected = st.multiselect(
-                    f"Select sheet(s) from **{filename}**",
-                    sheets,
-                    default=sheets[:1],
-                    key=f"sheet_select_{filename}"
-                )
-                if selected:
-                    selected_sheets[filename] = selected
-        
-        total_sheets = sum(len(sheets) for sheets in selected_sheets.values())
-        
-        if total_sheets == 0:
-            st.warning("Please select at least one sheet to proceed.")
-            return
-        
-        st.success(f"✅ {total_sheets} sheet(s) selected from {len(selected_sheets)} file(s)")
-        
-        # Clear sheet_data and rebuild based on current selection
-        st.session_state.sheet_data = {}
-        
-        for filename, sheets in selected_sheets.items():
-            file = st.session_state.uploaded_files[filename]
-            for sheet_name in sheets:
-                key = (filename, sheet_name)
-                
-                if filename.endswith('.csv'):
-                    df = pd.read_csv(file)
-                else:
-                    df = pd.read_excel(file, sheet_name=sheet_name)
-                
-                st.session_state.sheet_data[key] = df
-        
-        # Clean up removed sheets from all session state
-        current_keys = set(st.session_state.sheet_data.keys())
-        all_keys = set()
-        all_keys.update(st.session_state.sheet_configs.keys())
-        all_keys.update(st.session_state.tagging_configs.keys())
-        
-        removed_keys = all_keys - current_keys
-        if removed_keys:
-            for removed_key in removed_keys:
-                if removed_key in st.session_state.sheet_configs:
-                    del st.session_state.sheet_configs[removed_key]
-                if removed_key in st.session_state.tagging_configs:
-                    del st.session_state.tagging_configs[removed_key]
-            
-            removed_sheet_names = [f"{filename}/{sheet_name}" for filename, sheet_name in removed_keys]
-            st.info(f"🗑️ Cleaned up configurations for removed sheets: {', '.join(removed_sheet_names)}")
-        
-        st.header("📊 Column Configuration")
-        
-        if total_sheets == 1:
-            key = list(st.session_state.sheet_data.keys())[0]
+                df = pd.read_excel(file, sheet_name=sheet_name)
+
+            st.session_state.sheet_data[key] = df
+
+    # Clean up removed sheets
+    current_keys = set(st.session_state.sheet_data.keys())
+    all_keys = set()
+    all_keys.update(st.session_state.sheet_configs.keys())
+    all_keys.update(st.session_state.tagging_configs.keys())
+
+    for removed_key in (all_keys - current_keys):
+        st.session_state.sheet_configs.pop(removed_key, None)
+        st.session_state.tagging_configs.pop(removed_key, None)
+
+    # Column Configuration
+    st.subheader("Column Mapping")
+
+    if total_sheets == 1:
+        key = list(st.session_state.sheet_data.keys())[0]
+        df = st.session_state.sheet_data[key]
+
+        config = create_column_config(df, key)
+        st.session_state.sheet_configs[key] = config
+
+        # Data preview
+        with st.expander(f"Preview ({len(df)} rows)", expanded=False):
+            st.dataframe(df.head(10), use_container_width=True)
+    else:
+        for key in st.session_state.sheet_data.keys():
             filename, sheet_name = key
             df = st.session_state.sheet_data[key]
-            
-            st.subheader(f"Configure: {filename} - {sheet_name}")
-            config = create_column_config(df, key)
-            st.session_state.sheet_configs[key] = config
-            
-            st.subheader("📋 Data Preview")
-            st.dataframe(df.head(10), use_container_width=True)
-            st.info(f"Showing first 10 rows of {len(df)} total rows")
-            
-        else:
-            for key in st.session_state.sheet_data.keys():
-                filename, sheet_name = key
-                df = st.session_state.sheet_data[key]
-                
-                with st.expander(f"Configure input data: {sheet_name}", expanded=False):
-                    config = create_column_config(df, key)
-                    st.session_state.sheet_configs[key] = config
-                    
-                    st.subheader("📋 Data Preview")
-                    st.dataframe(df.head(10), use_container_width=True)
-                    st.info(f"Showing first 10 rows of {len(df)} total rows")
+
+            with st.expander(f"{sheet_name} ({len(df)} rows)", expanded=False):
+                config = create_column_config(df, key)
+                st.session_state.sheet_configs[key] = config
+
+                st.dataframe(df.head(5), use_container_width=True)
 
 
 def create_taxonomy_config(sheet_key, config_idx, config):
-    """Create taxonomy configuration UI"""
-    
-    col1, col2, col3 = st.columns([2, 2, 6])
-    with col1:
-        st.subheader("📋 Taxonomy Setup")
-    with col2:
-        use_categories = st.checkbox(
-            "Use tag categories", 
-            key=f"use_cat_{sheet_key}_{config_idx}"
-        )
-    with col3:
-        create_tag_categories_helper(f"taxonomy_{sheet_key}_{config_idx}")
-    
-    taxonomy_method = st.selectbox(
-        "How would you like to provide the taxonomy?",
-        ["Upload Excel file", "Paste as text", "Enter manually"],
-        key=f"tax_method_{sheet_key}_{config_idx}"
+    """Create simplified taxonomy configuration UI"""
+
+    # Taxonomy file upload (primary method)
+    taxonomy_file = st.file_uploader(
+        "Upload taxonomy file (Excel)",
+        type=['xlsx', 'xls'],
+        key=f"tax_file_{sheet_key}_{config_idx}",
+        help="Excel with columns: Tag, Description (optionally: Category)"
     )
-    
-    if taxonomy_method == "Upload Excel file":
-        taxonomy_file = st.file_uploader(
-            "Upload taxonomy file", 
-            type=['xlsx', 'xls'],
-            key=f"tax_file_{sheet_key}_{config_idx}"
+
+    if taxonomy_file:
+        tax_sheet = None
+        tax_excel = pd.ExcelFile(taxonomy_file)
+        if len(tax_excel.sheet_names) > 1:
+            tax_sheet = st.selectbox("Sheet", tax_excel.sheet_names,
+                                    key=f"tax_sheet_{sheet_key}_{config_idx}")
+
+        taxonomy = st.session_state.tagger.load_taxonomy_from_excel(taxonomy_file, tax_sheet)
+        config['taxonomy'] = taxonomy
+
+        # Show loaded tags compactly
+        total_tags = sum(len(tags) for tags in taxonomy.categories.values())
+        st.success(f"Loaded {total_tags} tags")
+
+        with st.expander("View taxonomy", expanded=False):
+            for category, tags in taxonomy.categories.items():
+                if category != 'default':
+                    st.caption(category)
+                for tag in tags:
+                    desc = taxonomy.descriptions.get(tag, "")
+                    st.write(f"• {tag}" + (f" - {desc}" if desc else ""))
+
+    # Show format help in collapsed expander
+    with st.expander("Format guide", expanded=False):
+        st.caption("Excel format: Tag and Description columns. Add Category column for grouped tags.")
+        example_data = {
+            "Tag": ["Software", "Hardware", "Consulting"],
+            "Description": ["Software development", "Hardware manufacturing", "Professional services"]
+        }
+        st.dataframe(pd.DataFrame(example_data), use_container_width=True, hide_index=True)
+
+    # Alternative input methods in collapsed expander
+    with st.expander("Other input methods", expanded=False):
+        alt_method = st.radio(
+            "Method",
+            ["YAML text", "Manual entry"],
+            key=f"alt_method_{sheet_key}_{config_idx}",
+            horizontal=True,
+            label_visibility="collapsed"
         )
-        if taxonomy_file:
-            tax_sheet = None
-            if taxonomy_file.name.endswith(('.xlsx', '.xls')):
-                tax_excel = pd.ExcelFile(taxonomy_file)
-                if len(tax_excel.sheet_names) > 1:
-                    tax_sheet = st.selectbox("Select taxonomy sheet", 
-                                            tax_excel.sheet_names,
-                                            key=f"tax_sheet_{sheet_key}_{config_idx}")
-            
-            taxonomy = st.session_state.tagger.load_taxonomy_from_excel(taxonomy_file, tax_sheet)
-            config['taxonomy'] = taxonomy
-            st.success("✅ Taxonomy loaded!")
-            
-            with st.expander("View loaded taxonomy"):
-                for category, tags in taxonomy.categories.items():
-                    st.write(f"**{category}**")
-                    for tag in tags:
-                        desc = taxonomy.descriptions.get(tag, "")
-                        st.write(f"- {tag}: {desc}" if desc else f"- {tag}")
-        
-        st.subheader("📋 Excel Taxonomy Formatting")
-        
-        if use_categories:
-            st.markdown("Starting in cell A1, three columns: **Category**, **Tag**, and **Description** of tag.")
-            st.markdown("**Excel Taxonomy Formatting - Example**")
-            
-            categorized_data = {
-                "Category": ["Technology", "Technology", "Healthcare", "Healthcare", "Finance", "Finance"],
-                "Tag": ["Software", "Hardware", "Pharmaceutical", "Medical Devices", "Banking", "Fintech"],
-                "Description": [
-                    "Companies that develop software products",
-                    "Companies that manufacture hardware", 
-                    "Drug development and manufacturing",
-                    "Medical equipment manufacturers",
-                    "Traditional banking services",
-                    "Financial technology companies"
-                ]
-            }
-            categorized_df = pd.DataFrame(categorized_data)
-            
-            st.markdown("""
-            <style>
-            .small-table table {
-                font-size: 12px !important;
-            }
-            .small-table td, .small-table th {
-                font-size: 12px !important;
-                padding: 4px 8px !important;
-            }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            st.markdown('<div class="small-table">', unsafe_allow_html=True)
-            st.table(categorized_df)
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-        else:
-            st.markdown("Starting in cell A1, two columns: **Tag** and **Description** of tag.")
-            st.markdown("**Excel Taxonomy Formatting - Example**")
-            
-            simple_data = {
-                "Tag": ["Software", "Hardware", "Consulting"],
-                "Description": [
-                    "Companies that develop software",
-                    "Companies that manufacture hardware",
-                    "Professional services companies"
-                ]
-            }
-            simple_df = pd.DataFrame(simple_data)
-            
-            st.markdown("""
-            <style>
-            .small-table table {
-                font-size: 12px !important;
-            }
-            .small-table td, .small-table th {
-                font-size: 12px !important;
-                padding: 4px 8px !important;
-            }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            st.markdown('<div class="small-table">', unsafe_allow_html=True)
-            st.table(simple_df)
-            st.markdown('</div>', unsafe_allow_html=True)
-    
-    elif taxonomy_method == "Paste as text":
-        st.markdown("Paste your taxonomy in YAML format:")
-        
-        if use_categories:
-            taxonomy_label = "Taxonomy"
-            taxonomy_placeholder = """categories:
-  Category1:
-    - Tag1
-    - Tag2
-  Category2:
-    - Tag3
-    - Tag4
-descriptions:
-  Tag1: "Description of Tag1"
-  Tag2: "Description of Tag2"
-  Tag3: "Description of Tag3"
-  Tag4: "Description of Tag4"
-"""
-        else:
-            taxonomy_label = "Taxonomy\n\nSince tags are not categorized, there is one category of tags called 'default'."
-            taxonomy_placeholder = """categories:
-  default:
-    - Tag1
-    - Tag2
-    - Tag3
-descriptions:
-  Tag1: "Description of Tag1"
-  Tag2: "Description of Tag2"
-  Tag3: "Description of Tag3"
-"""
-        
-        taxonomy_text = st.text_area(taxonomy_label, height=300, 
-                                placeholder=taxonomy_placeholder,
-                                key=f"tax_text_{sheet_key}_{config_idx}")
-        
-        if st.button("Parse Taxonomy", key=f"parse_tax_{sheet_key}_{config_idx}"):
-            try:
-                taxonomy_dict = yaml.safe_load(taxonomy_text)
-                taxonomy = st.session_state.tagger.load_taxonomy_from_dict(taxonomy_dict)
-                config['taxonomy'] = taxonomy
-                st.success("✅ Taxonomy parsed successfully!")
-            except Exception as e:
-                st.error(f"Failed to parse YAML taxonomy: {str(e)}")
-    
-    else:
-        st.markdown("Enter tags manually:")
-        
-        categories = {}
-        descriptions = {}
-        
-        if use_categories:
-            num_categories = st.number_input("Number of categories", 1, 10, 1, 
-                                           key=f"num_cat_{sheet_key}_{config_idx}")
-            
-            for i in range(num_categories):
-                with st.expander(f"Category {i+1}", expanded=i==0):
-                    cat_name = st.text_input(f"Category name", "default", 
-                                           key=f"cat_{sheet_key}_{config_idx}_{i}")
-                    tags_text = st.text_area(
-                        "Tags (one per line)", 
-                        key=f"tags_{sheet_key}_{config_idx}_{i}",
-                        help="Enter each tag on a new line"
-                    )
-                    st.markdown("*You will enter descriptions for each tag after entering the list of tags themselves and clicking \"Create Taxonomy\".*")
-                    
-                    if tags_text:
-                        tags = [t.strip() for t in tags_text.split('\n') if t.strip()]
-                        categories[cat_name] = tags
-                        
-                        if st.checkbox("Add descriptions", key=f"desc_check_{sheet_key}_{config_idx}_{i}"):
-                            for tag in tags:
-                                desc = st.text_input(f"Description for '{tag}'", 
-                                                key=f"desc_{sheet_key}_{config_idx}_{i}_{tag}")
-                                if desc:
-                                    descriptions[tag] = desc
-        else:
+
+        if alt_method == "YAML text":
+            taxonomy_text = st.text_area(
+                "YAML",
+                height=150,
+                key=f"tax_text_{sheet_key}_{config_idx}",
+                placeholder="categories:\n  default:\n    - Tag1\n    - Tag2\ndescriptions:\n  Tag1: \"Description\"",
+                label_visibility="collapsed"
+            )
+
+            if st.button("Parse", key=f"parse_tax_{sheet_key}_{config_idx}"):
+                try:
+                    taxonomy_dict = yaml.safe_load(taxonomy_text)
+                    taxonomy = st.session_state.tagger.load_taxonomy_from_dict(taxonomy_dict)
+                    config['taxonomy'] = taxonomy
+                    st.success("Taxonomy loaded")
+                except Exception as e:
+                    st.error(f"Parse error: {str(e)}")
+
+        else:  # Manual entry
             tags_text = st.text_area(
-                "Tags (one per line)", 
+                "Tags (one per line)",
                 key=f"tags_simple_{sheet_key}_{config_idx}",
-                help="Enter each tag on a new line"
+                height=100,
+                label_visibility="collapsed",
+                placeholder="Tag1\nTag2\nTag3"
             )
-            st.markdown("*You will enter descriptions for each tag after entering the list of tags themselves and clicking \"Create Taxonomy\".*")
-            
-            if tags_text:
+
+            if tags_text and st.button("Create", key=f"create_tax_{sheet_key}_{config_idx}"):
                 tags = [t.strip() for t in tags_text.split('\n') if t.strip()]
-                categories["default"] = tags
-                
-                if st.checkbox("Add descriptions", key=f"desc_check_simple_{sheet_key}_{config_idx}"):
-                    for tag in tags:
-                        desc = st.text_input(f"Description for '{tag}'", 
-                                        key=f"desc_simple_{sheet_key}_{config_idx}_{tag}")
-                        if desc:
-                            descriptions[tag] = desc
-        
-        if st.button("Create Taxonomy", key=f"create_tax_{sheet_key}_{config_idx}"):
-            taxonomy = TaxonomyConfig(
-                categories=categories,
-                descriptions=descriptions
-            )
-            config['taxonomy'] = taxonomy
-            st.success("✅ Taxonomy created!")
-    
-    st.subheader("Add custom instructions (optional)")
-    st.markdown("<small>Instructions for search behavior and tagging decisions</small>", unsafe_allow_html=True)
-    
-    custom_instructions = st.text_area(
-        "Custom instructions",
-        value=config.get('custom_instructions', ''),
-        height=150,
-        key=f"custom_inst_{sheet_key}_{config_idx}",
-        placeholder="""Examples:
-- Prioritize more specific manufacturing tags over general "manufacturing" tag
-- Base classification on company's end-customers rather than what the company does""",
-        help="Optional instructions to guide search and tagging"
-    )
-    
-    if custom_instructions:
-        validation_error = validate_custom_instructions(custom_instructions)
-        if validation_error:
-            st.error(validation_error)
-            config['custom_instructions'] = ""
+                taxonomy = TaxonomyConfig(categories={"default": tags}, descriptions={})
+                config['taxonomy'] = taxonomy
+                st.success(f"Created {len(tags)} tags")
+
+    # Custom instructions (collapsed by default)
+    with st.expander("Custom instructions", expanded=False):
+        custom_instructions = st.text_area(
+            "Additional guidance for tagging",
+            value=config.get('custom_instructions', ''),
+            height=80,
+            key=f"custom_inst_{sheet_key}_{config_idx}",
+            placeholder="E.g., Prioritize specific tags over general ones",
+            label_visibility="collapsed"
+        )
+
+        if custom_instructions:
+            validation_error = validate_custom_instructions(custom_instructions)
+            if validation_error:
+                st.error(validation_error)
+                config['custom_instructions'] = ""
+            else:
+                config['custom_instructions'] = custom_instructions
         else:
-            config['custom_instructions'] = custom_instructions
-            st.info(f"✅ Custom instructions added ({len(custom_instructions)} characters)")
-    else:
-        config['custom_instructions'] = ""
+            config['custom_instructions'] = ""
 
 
 def create_custom_prompt_config(sheet_key, config_idx, config):
-    """Create custom prompt configuration UI"""
-    
-    st.subheader("✍️ Prompt Configuration")
-    st.markdown("<small>Custom queries method is recommended only if required, i.e. if you do not have a complete list of tags for your task. If you have a list of tags, Taxonomy method is recommended for optimal results.</small>", unsafe_allow_html=True)
-    
+    """Create simplified custom prompt configuration UI"""
+
+    st.caption("Use a preset or write your own analysis prompt")
+
+    # Simplified preset selection
+    preset_options = ["Custom"] + [k for k in PRESET_PROMPTS.keys() if k != "Custom Analysis"]
     preset_choice = st.selectbox(
-        "Choose a preset prompt or create custom:",
-        list(PRESET_PROMPTS.keys()),
-        key=f"preset_{sheet_key}_{config_idx}"
+        "Start from preset",
+        preset_options,
+        key=f"preset_{sheet_key}_{config_idx}",
+        label_visibility="collapsed"
     )
-    
-    if preset_choice == "Custom Analysis":
-        custom_prompt = st.text_area(
-            "Enter your custom prompt:",
-            value=config.get('custom_prompt', ''),
-            height=200,
-            key=f"prompt_{sheet_key}_{config_idx}",
-            placeholder="Example: Analyze and classify this entity..."
-        )
+
+    # Get initial value
+    if preset_choice == "Custom":
+        initial_value = config.get('custom_prompt', '')
     else:
-        custom_prompt = st.text_area(
-            "Prompt (you can edit):",
-            value=PRESET_PROMPTS[preset_choice],
-            height=200,
-            key=f"prompt_{sheet_key}_{config_idx}"
-        )
-    
+        initial_value = PRESET_PROMPTS.get(preset_choice, '')
+
+    custom_prompt = st.text_area(
+        "Prompt",
+        value=initial_value,
+        height=150,
+        key=f"prompt_{sheet_key}_{config_idx}",
+        placeholder="Analyze and classify this entity...",
+        label_visibility="collapsed"
+    )
+
     config['custom_prompt'] = custom_prompt
-    
-    with st.expander("💡 Prompt Tips"):
-        st.markdown("""
-        **Tips for writing effective prompts:**
-        - Be specific about what you want to classify or analyze
-        - Define clear categories or output format
-        - Include any specific criteria for classification
-        - Ask for reasoning to understand the AI's decision
-        
-        **Example format:**
-        "You are an expert at [domain]. Analyze the entity and classify it as [categories]. 
-        Consider [specific factors]. Provide your answer as '[Output format]' with explanation."
+
+    with st.expander("Tips", expanded=False):
+        st.caption("""
+• Be specific about classification categories
+• Define the expected output format
+• Include criteria for decision-making
         """)
 
 
 def create_tagging_method_tab():
     """Create the Tagging Method tab with multi-config support"""
-    st.header("🎯 Tagging Method")
-    
-    st.info("ℹ️ For each sheet, tool will output the original sheet plus an additional column with tagged results. Multiple configurations for one sheet will output one sheet plus an additional column with tagged results for each configuration.")
-    
+    st.header("Tagging Method")
+
     if not st.session_state.sheet_data:
-        st.warning("Please upload and configure data in the Data Input tab first.")
+        st.warning("Upload data in the Data Input tab first.")
         return
-    
-    # Clean up configs for sheets that no longer exist
+
+    # Clean up orphaned configs
     current_sheet_keys = set(st.session_state.sheet_data.keys())
-    config_keys = set(st.session_state.tagging_configs.keys())
-    orphaned_keys = config_keys - current_sheet_keys
-    
-    if orphaned_keys:
-        for orphaned_key in orphaned_keys:
-            del st.session_state.tagging_configs[orphaned_key]
-        st.info(f"🗑️ Cleaned up {len(orphaned_keys)} configuration(s) for removed sheets")
-    
+    for orphaned_key in (set(st.session_state.tagging_configs.keys()) - current_sheet_keys):
+        del st.session_state.tagging_configs[orphaned_key]
+
     for sheet_key in st.session_state.sheet_data.keys():
         if sheet_key not in st.session_state.tagging_configs:
             st.session_state.tagging_configs[sheet_key] = []
-    
+
     all_configs = []
     for sheet_key in st.session_state.sheet_data.keys():
         filename, sheet_name = sheet_key
         configs = st.session_state.tagging_configs[sheet_key]
-        
+
         if len(configs) == 0:
             st.session_state.tagging_configs[sheet_key].append({
                 'config_num': 1,
@@ -1678,7 +1453,7 @@ def create_tagging_method_tab():
                 'custom_instructions': ''
             })
             configs = st.session_state.tagging_configs[sheet_key]
-        
+
         for idx, config in enumerate(configs):
             all_configs.append({
                 'sheet_key': sheet_key,
@@ -1686,36 +1461,40 @@ def create_tagging_method_tab():
                 'config_idx': idx,
                 'config': config
             })
-    
+
     for item in all_configs:
         sheet_key = item['sheet_key']
         sheet_name = item['sheet_name']
         config_idx = item['config_idx']
         config = item['config']
         config_num = config['config_num']
-        
-        title = f"Configure tagging method {config_num} for {sheet_name}" if config_num > 1 else f"Configure tagging method for {sheet_name}"
-        
+
+        title = f"{sheet_name} - Config {config_num}" if config_num > 1 else sheet_name
+
         with st.expander(title, expanded=(len(all_configs) == 1)):
-            
-            method = st.selectbox(
-                "Choose tagging method:",
+
+            method = st.radio(
+                "Tagging method",
                 ["Use Taxonomy", "Use Custom Prompt"],
                 key=f"method_{sheet_key}_{config_idx}",
-                index=0 if config['method'] == 'Use Taxonomy' else 1
+                index=0 if config['method'] == 'Use Taxonomy' else 1,
+                horizontal=True,
+                help="Taxonomy: classify into predefined tags. Custom Prompt: free-form analysis."
             )
             config['method'] = method
-            
+
             if method == "Use Taxonomy":
                 create_taxonomy_config(sheet_key, config_idx, config)
             else:
                 create_custom_prompt_config(sheet_key, config_idx, config)
-            
-            col1, col2 = st.columns(2)
-            
+
+            # Add/remove config buttons - simplified
+            st.markdown("---")
+            col1, col2 = st.columns([1, 1])
+
             with col1:
-                if st.button(f"➕ Add another tagging configuration for {sheet_name}", 
-                           key=f"add_config_{sheet_key}_{config_idx}"):
+                if st.button(f"Add configuration", key=f"add_config_{sheet_key}_{config_idx}",
+                           use_container_width=True):
                     configs = st.session_state.tagging_configs[sheet_key]
                     st.session_state.tagging_configs[sheet_key].append({
                         'config_num': len(configs) + 1,
@@ -1725,77 +1504,72 @@ def create_tagging_method_tab():
                         'custom_instructions': ''
                     })
                     st.rerun()
-            
+
             with col2:
                 if config_num > 1:
-                    if st.button(f"🗑️ Remove this configuration", 
-                               key=f"remove_{sheet_key}_{config_idx}"):
+                    if st.button("Remove", key=f"remove_{sheet_key}_{config_idx}",
+                               use_container_width=True):
                         st.session_state.tagging_configs[sheet_key].pop(config_idx)
                         st.rerun()
 
 
 def create_row_selection_ui(job, key_suffix):
-    """Create row selection UI for a tagging job"""
+    """Create simplified row selection UI for a tagging job"""
     df = job['df']
     sheet_config = job['sheet_config']
-    tagging_config = job.get('tagging_config', {})
-    
-    # Add multi-select checkbox for all configurations
-    st.subheader("Tagging Options")
-    multi_select = st.checkbox(
-        "Allow multiple tags per entity",
-        value=job.get('multi_select', False),
-        key=f"multi_select_{key_suffix}",
-        help="When enabled, the model can assign multiple tags (one primary and multiple secondary tags) to each entity"
-    )
-    job['multi_select'] = multi_select
-    
-    st.subheader("Select rows to process")
-    
-    run_test = st.checkbox("Run a Test", key=f"test_{key_suffix}")
-    st.markdown("<small>Tags first 10 rows only, to preview output (recommended before processing full dataset)</small>", unsafe_allow_html=True)
-    
-    if run_test:
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        # Simplified row selection
+        row_option = st.radio(
+            "Rows to process",
+            ["All rows", "Test (first 10)", "Custom selection"],
+            key=f"row_option_{key_suffix}",
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+
+    with col2:
+        multi_select = st.checkbox(
+            "Allow multiple tags",
+            value=job.get('multi_select', False),
+            key=f"multi_select_{key_suffix}",
+            help="Assign primary and secondary tags"
+        )
+        job['multi_select'] = multi_select
+
+    if row_option == "Test (first 10)":
         job['selected_rows'] = df.head(10)
-        st.info(f"Test mode: Will process first {len(job['selected_rows'])} rows")
+        st.caption(f"Will process first 10 of {len(df)} rows")
         return
-    
-    choose_rows = st.checkbox("Choose rows to process", value=False, key=f"choose_{key_suffix}")
-    
-    if not choose_rows:
+
+    if row_option == "All rows":
         job['selected_rows'] = df
         return
-    
-    has_category_column = sheet_config.get('category_column')
-    if has_category_column:
-        st.markdown("<small>Tool will process all rows you select using \"Select range\", \"Select rows\", and \"Select categories\".</small>", unsafe_allow_html=True)
-    else:
-        st.markdown("<small>Tool will process all rows you select using \"Select range\" and \"Select rows\". (Optionally, configure a Category column in the Data Input tab in order to select rows by category)</small>", unsafe_allow_html=True)
-    
+
+    # Custom selection options (collapsed by default)
     selected_indices = set()
-    
-    select_range = st.checkbox("Select range", key=f"range_{key_suffix}", help="Select a continuous range of rows")
-    if select_range:
+
+    selection_method = st.radio(
+        "Selection method",
+        ["Row range", "Specific rows"] + (["By category"] if sheet_config.get('category_column') else []),
+        key=f"sel_method_{key_suffix}",
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+
+    if selection_method == "Row range":
         col1, col2 = st.columns(2)
         with col1:
-            start_row = st.number_input("Starting row", 1, len(df), 1, key=f"start_{key_suffix}")
+            start_row = st.number_input("From", 1, len(df), 1, key=f"start_{key_suffix}")
         with col2:
-            end_row = st.number_input("End row", start_row, len(df), min(10, len(df)), key=f"end_{key_suffix}")
-        
+            end_row = st.number_input("To", start_row, len(df), min(10, len(df)), key=f"end_{key_suffix}")
         if start_row <= end_row:
             selected_indices.update(range(start_row - 1, end_row))
-    
-    select_manual = st.checkbox("Select rows", key=f"manual_{key_suffix}", help="Manually select specific row indices")
-    if select_manual:
-        st.markdown("""
-        <small>
-        • Supports individual numbers: 1,3,5,10<br>
-        • Supports ranges: 5-8 (includes rows 5,6,7,8)<br>
-        • Supports combinations: 1,3,5-8,10
-        </small>
-        """, unsafe_allow_html=True)
-        
-        manual_rows = st.text_input("Row numbers (e.g., 1,3,5-8,10)", key=f"manual_input_{key_suffix}")
+
+    elif selection_method == "Specific rows":
+        manual_rows = st.text_input("Rows (e.g., 1,3,5-8)", key=f"manual_input_{key_suffix}")
         if manual_rows:
             try:
                 for part in manual_rows.split(','):
@@ -1809,23 +1583,21 @@ def create_row_selection_ui(job, key_suffix):
                         if 1 <= row_num <= len(df):
                             selected_indices.add(row_num - 1)
             except:
-                st.error("Invalid format. Use comma-separated numbers or ranges (e.g., 1,3,5-8,10)")
-    
-    if has_category_column:
-        select_categories = st.checkbox("Select categories", key=f"cat_{key_suffix}", help="Select rows by category values")
-        if select_categories:
-            categories = df[sheet_config['category_column']].unique()
-            selected_cats = st.multiselect("Categories", categories, key=f"cats_{key_suffix}", help="Select categories to include")
-            if selected_cats:
-                mask = df[sheet_config['category_column']].isin(selected_cats)
-                selected_indices.update(df[mask].index)
-    
+                st.error("Invalid format")
+
+    elif selection_method == "By category" and sheet_config.get('category_column'):
+        categories = df[sheet_config['category_column']].unique()
+        selected_cats = st.multiselect("Categories", categories, key=f"cats_{key_suffix}")
+        if selected_cats:
+            mask = df[sheet_config['category_column']].isin(selected_cats)
+            selected_indices.update(df[mask].index)
+
     if selected_indices:
         job['selected_rows'] = df.loc[sorted(selected_indices)]
     else:
         job['selected_rows'] = df.iloc[0:0]
-    
-    st.info(f"Selected {len(job.get('selected_rows', df))} rows")
+
+    st.caption(f"Selected {len(job.get('selected_rows', df))} rows")
 
 
 def run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries):
@@ -1942,33 +1714,16 @@ def run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries
     st.session_state.results = final_results_by_sheet
     st.session_state.processing = False
     
-    st.success(f"✅ Processing complete! Processed {completed} entities across {len(tagging_jobs)} configurations")
-    
-    if len(tagging_jobs) > 1:
-        with st.expander("📊 Per-Configuration Statistics"):
-            for job_idx, job in enumerate(tagging_jobs):
-                sheet_name = job['sheet_name']
-                config_num = job['config_num']
-                job_results = results_by_job[job_idx]
-                
-                if job_results:
-                    status_counts = {}
-                    for result in job_results:
-                        status = result.get('Status', 'Unknown')
-                        status_counts[status] = status_counts.get(status, 0) + 1
-                    
-                    st.write(f"**{sheet_name} - Configuration {config_num}:**")
-                    for status, count in status_counts.items():
-                        st.write(f"- {status}: {count}")
+    st.success(f"Complete! {completed} entities processed")
     
     create_download_buttons(final_results_by_sheet)
 
 
 def create_download_buttons(results_by_sheet):
     """Create download buttons for results"""
-    st.header("📥 Download Results")
+    st.header("Results")
 
-    # Prepare tagged dataframes for all sheets
+    # Prepare tagged dataframes
     prepared_dfs = {}
     for (filename, sheet_name), df in results_by_sheet.items():
         if 'Status' in df.columns:
@@ -1985,55 +1740,47 @@ def create_download_buttons(results_by_sheet):
 
         if len(tagged_df) > 0:
             prepared_dfs[(filename, sheet_name)] = tagged_df
-        else:
-            st.warning(f"⚠️ No results to export for sheet: {sheet_name}")
 
     if not prepared_dfs:
-        st.error("No results available to download. All sheets are empty.")
+        st.error("No results to download.")
         return
 
-    col1, col2, col3 = st.columns([2, 2, 1])
+    # Download buttons - compact layout
+    col1, col2, col3 = st.columns([1, 1, 1])
 
-    # Excel download with error handling
     with col1:
-        excel_error = None
         try:
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 for (filename, sheet_name), tagged_df in prepared_dfs.items():
                     safe_sheet_name = sheet_name[:31]
-                    # Sanitize the dataframe to remove illegal characters
                     sanitized_df = sanitize_dataframe_for_excel(tagged_df)
                     sanitized_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
             st.download_button(
-                label="📥 Download All Results (Excel)",
+                label="Download Excel",
                 data=output.getvalue(),
-                file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                file_name=f"tagged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
             )
         except Exception as e:
-            excel_error = str(e)
-            st.error(f"⚠️ Excel export failed: {excel_error}")
-            st.info("Please use the CSV download option instead.")
+            st.error(f"Excel failed: {str(e)}")
 
-    # CSV download as alternative/fallback
     with col2:
         try:
-            # For multiple sheets, create a zip file with CSVs
             if len(prepared_dfs) == 1:
-                # Single sheet - direct CSV download
                 (filename, sheet_name), tagged_df = list(prepared_dfs.items())[0]
                 csv_output = io.StringIO()
                 tagged_df.to_csv(csv_output, index=False)
                 st.download_button(
-                    label="📥 Download as CSV",
+                    label="Download CSV",
                     data=csv_output.getvalue(),
-                    file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                    file_name=f"tagged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
                 )
             else:
-                # Multiple sheets - create zip with multiple CSVs
                 import zipfile
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -2044,22 +1791,21 @@ def create_download_buttons(results_by_sheet):
                         zip_file.writestr(f"{safe_name}.csv", csv_output.getvalue())
 
                 st.download_button(
-                    label="📥 Download as CSV (zip)",
+                    label="Download CSV (zip)",
                     data=zip_buffer.getvalue(),
-                    file_name=f"tagged_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                    mime="application/zip"
+                    file_name=f"tagged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True
                 )
         except Exception as e:
-            st.error(f"CSV export failed: {str(e)}")
+            st.error(f"CSV failed: {str(e)}")
 
     with col3:
-        if st.button("🗑️ Clear Results"):
+        if st.button("Clear", use_container_width=True):
             st.session_state.results = []
-            st.success("Results cleared!")
             st.rerun()
-        st.caption("💡 Clear after downloading")
-    
-    st.header("📊 Results Preview")
+
+    # Results preview - simplified
     for (filename, sheet_name), df in results_by_sheet.items():
         if 'Status' in df.columns:
             display_df = df[df['Status'].notna()].copy()
@@ -2072,59 +1818,50 @@ def create_download_buttons(results_by_sheet):
                 display_df = df[mask].copy()
             else:
                 display_df = df.copy()
-        
+
         if len(display_df) == 0:
-            st.warning(f"⚠️ No results to display for sheet: {sheet_name}")
             continue
-            
-        with st.expander(f"Results: {sheet_name} ({len(display_df)} tagged rows)", expanded=True):
-            show_filter = st.checkbox(f"Show filter options for {sheet_name}", key=f"filter_{sheet_name}")
-            if show_filter:
-                if 'Status' in display_df.columns:
-                    status_filter = st.multiselect(
-                        "Filter by status",
-                        display_df['Status'].unique(),
-                        default=display_df['Status'].unique(),
-                        key=f"status_filter_{sheet_name}"
+
+        with st.expander(f"{sheet_name} ({len(display_df)} rows)", expanded=True):
+            # Filter option
+            if 'Status' in display_df.columns:
+                statuses = display_df['Status'].unique().tolist()
+                if len(statuses) > 1:
+                    filter_status = st.multiselect(
+                        "Filter",
+                        statuses,
+                        default=statuses,
+                        key=f"filter_{sheet_name}",
+                        label_visibility="collapsed"
                     )
-                    filtered_df = display_df[display_df['Status'].isin(status_filter)]
-                else:
-                    filtered_df = display_df
-            else:
-                filtered_df = display_df
-            
-            st.dataframe(filtered_df, use_container_width=True)
-            st.info(f"Showing {len(filtered_df)} tagged rows")
+                    display_df = display_df[display_df['Status'].isin(filter_status)]
+
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def create_start_tagging_tab():
-    """Create the Start Tagging tab with concurrent processing"""
-    st.header("🚀 Start Tagging")
-    
+    """Create simplified Start Tagging tab"""
+    st.header("Run Tagging")
+
     if not st.session_state.sheet_data or not st.session_state.tagging_configs:
-        st.warning("Please complete configuration in previous tabs first.")
+        st.warning("Complete setup in previous tabs first.")
         return
-    
-    # Clean up configs for sheets that no longer exist
+
+    # Clean up orphaned configs
     current_sheet_keys = set(st.session_state.sheet_data.keys())
-    config_keys = set(st.session_state.tagging_configs.keys())
-    orphaned_keys = config_keys - current_sheet_keys
-    
-    if orphaned_keys:
-        for orphaned_key in orphaned_keys:
-            del st.session_state.tagging_configs[orphaned_key]
-    
+    for orphaned_key in (set(st.session_state.tagging_configs.keys()) - current_sheet_keys):
+        del st.session_state.tagging_configs[orphaned_key]
+
     tagging_jobs = []
     for sheet_key, configs in st.session_state.tagging_configs.items():
-        # Only process if sheet still exists in sheet_data
         if sheet_key not in st.session_state.sheet_data:
             continue
-            
+
         if configs:
             filename, sheet_name = sheet_key
             df = st.session_state.sheet_data[sheet_key]
             sheet_config = st.session_state.sheet_configs[sheet_key]
-            
+
             for config in configs:
                 tagging_jobs.append({
                     'sheet_key': sheet_key,
@@ -2135,124 +1872,96 @@ def create_start_tagging_tab():
                     'tagging_config': config,
                     'config_num': config['config_num']
                 })
-    
+
     if not tagging_jobs:
-        st.warning("No tagging configurations found. Please configure at least one tagging method.")
+        st.warning("Configure at least one tagging method.")
         return
-    
-    st.success(f"✅ {len(tagging_jobs)} tagging configuration(s) ready to process")
-    
+
+    # Row selection
     if len(tagging_jobs) > 1:
-        st.subheader("Configuration Summary")
-        
-        jobs_by_sheet = {}
         for job in tagging_jobs:
-            key = job['sheet_key']
-            if key not in jobs_by_sheet:
-                jobs_by_sheet[key] = []
-            jobs_by_sheet[key].append(job)
-        
-        for sheet_key, sheet_jobs in jobs_by_sheet.items():
-            filename, sheet_name = sheet_key
-            
-            with st.expander(f"📋 {sheet_name} ({len(sheet_jobs)} configuration(s))", expanded=False):
-                for job in sheet_jobs:
-                    method = job['tagging_config']['method']
-                    config_num = job['config_num']
-                    st.write(f"**Configuration {config_num}:** {method}")
-                    
-                    create_row_selection_ui(job, f"{sheet_key}_{config_num}")
+            sheet_name = job['sheet_name']
+            config_num = job['config_num']
+            with st.expander(f"{sheet_name}" + (f" - Config {config_num}" if config_num > 1 else ""), expanded=False):
+                create_row_selection_ui(job, f"{job['sheet_key']}_{config_num}")
     else:
         job = tagging_jobs[0]
         create_row_selection_ui(job, "single")
-    
-    st.header("⚙️ Processing Options")
-    
-    col1, col2, col3 = st.columns(3)
+
+    # Processing options in expander (with sensible defaults)
+    max_workers, batch_size, search_retries = 5, 100, 3
+
+    with st.expander("Advanced options", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            max_workers = st.number_input("Parallel threads", 1, 100, 5)
+        with col2:
+            batch_size = st.number_input("Checkpoint interval", 10, 1000, 100)
+        with col3:
+            search_retries = st.number_input("Max retries", 0, 10, 3)
+
+    total_rows = sum(len(job.get('selected_rows', job['df'])) for job in tagging_jobs)
+
+    st.markdown("---")
+
+    col1, col2 = st.columns([3, 1])
     with col1:
-        max_workers = st.number_input("Parallel threads", 1, 100, 5)
+        st.metric("Total rows to process", total_rows)
     with col2:
-        batch_size = st.number_input("Checkpoint batch size", 10, 1000, 100)
-    with col3:
-        search_retries = st.number_input("Search max retries", 0, 10, 3)
-    
-    total_rows = sum(
-        len(job.get('selected_rows', job['df'])) 
-        for job in tagging_jobs
-    )
-    
-    st.info(f"**Will process {total_rows} total rows across {len(tagging_jobs)} configuration(s)**")
-    
-    if st.button("🏁 Start Tagging", type="primary", disabled=st.session_state.processing):
-        run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries)
+        if st.button("Start", type="primary", disabled=st.session_state.processing,
+                    use_container_width=True):
+            run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries)
 
 
 def create_streamlit_app():
-    """Create the updated Streamlit user interface with multi-config support"""
-    st.set_page_config(page_title="Generic Tagging Tool", layout="wide")
-    
-    st.title("🏷️ Tagging Tool")
-    st.markdown("Tag any entities using AI with customizable taxonomies or prompts")
-    
+    """Create the Streamlit user interface"""
+    st.set_page_config(page_title="Tagging Tool", layout="wide")
+
+    st.title("Tagging Tool")
+
     initialize_session_state()
-    
-    with st.expander("📚 Quick Start Guide (4 steps)", expanded=False):
+
+    with st.expander("Help", expanded=False):
         st.markdown("""
-        ### 1. **Initialize** in the sidebar
-        Enter API keys. Perplexity key only needed if using Perplexity search (not needed for OpenAI search).
-        
-        ### 2. **Upload input data and map columns**
-        - Upload one or more Excel/CSV files
-        - Select one or more sheets per file
-        - Configure columns for each sheet
-        - **Note:** Removing files or deselecting sheets will automatically clean up their configurations
-        
-        ### 3. **Configure tagging methods**
-        - For each sheet, set up one or more tagging configurations
-        - Choose between Taxonomy or Custom Prompt for each configuration
-        
-        ### 4. **Start tagging**
-        - All configurations will run concurrently
-        - Multiple configurations for the same sheet will output to one sheet with multiple result columns
-        - Download results as Excel with separate sheets
+**1. Setup** - Enter OpenAI API key in sidebar
+
+**2. Data Input** - Upload file, map columns
+
+**3. Tagging Method** - Upload taxonomy or write prompt
+
+**4. Run** - Select rows and start tagging
         """)
     
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        with st.expander("🔑 API Keys", expanded=True):
-            openai_key = st.text_input("OpenAI API Key", type="password", 
-                                      help="Required for AI tagging")
-            perplexity_key = st.text_input("Perplexity API Key", type="password",
-                                         help="Optional - only needed if using Perplexity as search provider. Not required for OpenAI web search.")
-            
-            st.markdown("---")
-            checkpoint_path = st.text_input(
-                "Checkpoint Directory Path",
-                value="tagging_checkpoints",
-                help="Directory where checkpoint files will be saved"
+        st.header("Setup")
+
+        # Simplified API key inputs
+        openai_key = st.text_input("OpenAI API Key", type="password",
+                                  help="Required for AI tagging")
+        perplexity_key = st.text_input("Perplexity API Key (optional)", type="password",
+                                     help="Only needed if using Perplexity search")
+
+        # Auto-initialize when OpenAI key is provided
+        if openai_key and not st.session_state.tagger:
+            st.session_state.tagger = GenericTagger(
+                perplexity_api_key=perplexity_key if perplexity_key else None,
+                openai_api_key=openai_key,
+                checkpoint_dir="tagging_checkpoints"
             )
-            
-            if st.button("Initialize Tagger"):
-                if openai_key:
-                    st.session_state.tagger = GenericTagger(
-                        perplexity_api_key=perplexity_key if perplexity_key else None,
-                        openai_api_key=openai_key,
-                        checkpoint_dir=checkpoint_path
-                    )
-                    st.success("✅ Tagger initialized!")
-                else:
-                    st.error("OpenAI API key is required")
-        
+
+        # Update tagger if keys change
+        if openai_key and st.session_state.tagger:
+            if perplexity_key != st.session_state.tagger.perplexity_api_key:
+                st.session_state.tagger.perplexity_api_key = perplexity_key
+
         if st.session_state.tagger:
-            st.header("💾 Checkpoints")
-            
-            with st.expander("💾 Manage Checkpoints"):
+            st.success("Ready")
+
+            # Checkpoints in collapsed expander
+            with st.expander("Checkpoints", expanded=False):
                 checkpoint_dir = st.session_state.tagger.checkpoint_dir.absolute()
-                st.text(f"Directory: {checkpoint_dir}")
-                
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 try:
                     checkpoint_pkl_files = sorted(
                         checkpoint_dir.glob("*.pkl"),
@@ -2260,40 +1969,37 @@ def create_streamlit_app():
                         reverse=True
                     )
                 except Exception as e:
-                    st.error(f"Error reading checkpoint files: {e}")
                     checkpoint_pkl_files = []
-                
+
                 if checkpoint_pkl_files:
-                    st.write(f"Found {len(checkpoint_pkl_files)} checkpoint(s)")
-                    
                     selected_checkpoint = st.selectbox(
                         "Load checkpoint",
-                        ["None"] + [f.name for f in checkpoint_pkl_files]
+                        ["None"] + [f.name for f in checkpoint_pkl_files],
+                        label_visibility="collapsed"
                     )
-                    
-                    if selected_checkpoint != "None":
-                        if st.button("Load Checkpoint"):
-                            checkpoint_path = checkpoint_dir / selected_checkpoint
-                            loaded_results = st.session_state.tagger.load_checkpoint(checkpoint_path)
-                            st.session_state.results = loaded_results
-                            st.success(f"Loaded checkpoint")
-                    
-                    if st.button("Clear All Checkpoints"):
-                        for f in checkpoint_pkl_files:
-                            f.unlink()
-                        for f in checkpoint_dir.glob("*.csv"):
-                            f.unlink()
-                        st.success("All checkpoints cleared")
-                        st.rerun()
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if selected_checkpoint != "None":
+                            if st.button("Load", use_container_width=True):
+                                checkpoint_path_load = checkpoint_dir / selected_checkpoint
+                                loaded_results = st.session_state.tagger.load_checkpoint(checkpoint_path_load)
+                                st.session_state.results = loaded_results
+                                st.success("Loaded")
+                    with col2:
+                        if st.button("Clear All", use_container_width=True):
+                            for f in checkpoint_pkl_files:
+                                f.unlink()
+                            for f in checkpoint_dir.glob("*.csv"):
+                                f.unlink()
+                            st.rerun()
                 else:
-                    st.info("No checkpoints found yet. Checkpoints are created automatically during processing.")
+                    st.caption("No checkpoints yet")
+        else:
+            st.info("Enter OpenAI API key to start")
     
     if st.session_state.tagger:
-        tab1, tab2, tab3 = st.tabs([
-            "Data Input and Column Configuration",
-            "Tagging Method and Configuration", 
-            "Start Tagging"
-        ])
+        tab1, tab2, tab3 = st.tabs(["Data Input", "Tagging Method", "Run"])
         
         with tab1:
             create_data_input_tab()
@@ -2305,7 +2011,7 @@ def create_streamlit_app():
             create_start_tagging_tab()
     
     else:
-        st.warning("Please initialize the tagger with your API keys in the sidebar")
+        st.info("Enter your OpenAI API key in the sidebar to begin.")
 
 
 if __name__ == "__main__":
