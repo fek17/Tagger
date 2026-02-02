@@ -1062,6 +1062,8 @@ def initialize_session_state():
         st.session_state.sheet_configs = {}
     if 'tagging_configs' not in st.session_state:
         st.session_state.tagging_configs = {}
+    if 'last_tagging_jobs' not in st.session_state:
+        st.session_state.last_tagging_jobs = None
 
 
 def create_column_config(df, sheet_key):
@@ -1715,13 +1717,190 @@ def run_concurrent_tagging(tagging_jobs, max_workers, batch_size, search_retries
     st.session_state.processing = False
     
     st.success(f"Complete! {completed} entities processed")
-    
-    create_download_buttons(final_results_by_sheet)
+
+    # Store tagging jobs in session state for retry functionality
+    st.session_state.last_tagging_jobs = tagging_jobs
+
+    create_download_buttons(final_results_by_sheet, tagging_jobs)
 
 
-def create_download_buttons(results_by_sheet):
+def get_failed_rows_info(results_by_sheet):
+    """Identify rows with errors across all result sheets and status columns.
+
+    Returns dict mapping sheet_key -> list of (row_index, status_column) tuples
+    """
+    failed_info = {}
+    error_statuses = ['Error', 'Search Error', 'Config Error', 'Search Failed']
+
+    for sheet_key, df in results_by_sheet.items():
+        # Find all status columns (Status, Status_1, Status_2, etc.)
+        status_cols = [col for col in df.columns if col == 'Status' or col.startswith('Status_')]
+
+        failed_rows = []
+        for status_col in status_cols:
+            if status_col in df.columns:
+                # Find rows where this status column indicates an error
+                error_mask = df[status_col].isin(error_statuses)
+                for idx in df[error_mask].index:
+                    failed_rows.append((idx, status_col))
+
+        if failed_rows:
+            failed_info[sheet_key] = failed_rows
+
+    return failed_info
+
+
+def retry_failed_rows(tagging_jobs, failed_info, max_workers, batch_size, search_retries):
+    """Reprocess only the failed rows, updating existing results."""
+    st.session_state.processing = True
+
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    # Build tasks only for failed rows
+    all_tasks = []
+
+    for job_idx, job in enumerate(tagging_jobs):
+        sheet_key = job['sheet_key']
+        if sheet_key not in failed_info:
+            continue
+
+        df = job['df']
+        sheet_config = job['sheet_config']
+        tagging_config = job['tagging_config']
+        config_num = job['config_num']
+
+        # Determine which status column this job writes to
+        jobs_for_sheet = [j for j in tagging_jobs if j['sheet_key'] == sheet_key]
+        suffix = f"_{config_num}" if len(jobs_for_sheet) > 1 else ""
+        status_col = f"Status{suffix}"
+
+        # Get failed row indices for this specific config
+        failed_indices = set()
+        for idx, failed_status_col in failed_info[sheet_key]:
+            if failed_status_col == status_col or (failed_status_col == 'Status' and suffix == ''):
+                failed_indices.add(idx)
+
+        if not failed_indices:
+            continue
+
+        tagger_config = {
+            **sheet_config,
+            'use_taxonomy': tagging_config['method'] == 'Use Taxonomy',
+            'custom_prompt': tagging_config.get('custom_prompt'),
+            'taxonomy_custom_instructions': tagging_config.get('custom_instructions', ''),
+            'search_max_retries': search_retries,
+            'multi_select': job.get('multi_select', False),
+            'taxonomy': tagging_config.get('taxonomy')
+        }
+
+        for idx in failed_indices:
+            if idx in df.index:
+                row = df.loc[idx]
+                all_tasks.append({
+                    'job_idx': job_idx,
+                    'job': job,
+                    'idx': idx,
+                    'row': row,
+                    'config': tagger_config,
+                    'suffix': suffix
+                })
+
+    if not all_tasks:
+        st.warning("No failed rows found to retry.")
+        st.session_state.processing = False
+        return
+
+    completed = 0
+    total_tasks = len(all_tasks)
+
+    status_text.text(f"Retrying {total_tasks} failed rows...")
+
+    # Get current results to update
+    results_by_sheet = st.session_state.results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {
+            executor.submit(
+                st.session_state.tagger.process_single_entity,
+                task['row'].to_dict(),
+                task['config']
+            ): task
+            for task in all_tasks
+        }
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            sheet_key = task['job']['sheet_key']
+            suffix = task['suffix']
+            idx = task['idx']
+
+            try:
+                result = future.result()
+
+                # Update the existing results
+                for key, value in result.items():
+                    if key not in task['job']['df'].columns:
+                        col_name = f"{key}{suffix}"
+                        if col_name in results_by_sheet[sheet_key].columns:
+                            results_by_sheet[sheet_key].loc[idx, col_name] = value
+
+                completed += 1
+                progress = min(completed / total_tasks, 1.0)
+                progress_bar.progress(progress)
+
+                entity_name = result.get(task['config']['name_column'], 'Unknown')
+                new_status = result.get('Status', 'Unknown')
+                status_text.text(f"Retry {completed}/{total_tasks}: {entity_name} -> {new_status}")
+
+            except Exception as e:
+                st.error(f"Retry error: {str(e)}")
+                completed += 1
+                progress = min(completed / total_tasks, 1.0)
+                progress_bar.progress(progress)
+
+    progress_bar.progress(1.0)
+
+    # Count remaining errors
+    new_failed_info = get_failed_rows_info(results_by_sheet)
+    remaining_errors = sum(len(rows) for rows in new_failed_info.values())
+
+    st.session_state.results = results_by_sheet
+    st.session_state.processing = False
+
+    if remaining_errors > 0:
+        st.warning(f"Retry complete. {remaining_errors} errors remain.")
+    else:
+        st.success("All retries successful!")
+
+    st.rerun()
+
+
+def create_download_buttons(results_by_sheet, tagging_jobs=None):
     """Create download buttons for results"""
     st.header("Results")
+
+    # Check for failed rows
+    failed_info = get_failed_rows_info(results_by_sheet)
+    total_errors = sum(len(rows) for rows in failed_info.values())
+
+    # Show error summary and retry option
+    if total_errors > 0 and tagging_jobs:
+        st.warning(f"{total_errors} rows have errors")
+
+        col_retry, col_info = st.columns([1, 3])
+        with col_retry:
+            if st.button("Retry Failed", type="primary", use_container_width=True,
+                        disabled=st.session_state.processing):
+                retry_failed_rows(tagging_jobs, failed_info, max_workers=5,
+                                 batch_size=100, search_retries=3)
+        with col_info:
+            # Show breakdown by sheet
+            error_details = []
+            for sheet_key, rows in failed_info.items():
+                sheet_name = sheet_key[1] if isinstance(sheet_key, tuple) else str(sheet_key)
+                error_details.append(f"{sheet_name}: {len(rows)}")
+            st.caption(f"Errors by sheet: {', '.join(error_details)}")
 
     # Prepare tagged dataframes
     prepared_dfs = {}
@@ -1842,6 +2021,29 @@ def create_download_buttons(results_by_sheet):
 def create_start_tagging_tab():
     """Create simplified Start Tagging tab"""
     st.header("Run Tagging")
+
+    # Show existing results with retry option if available
+    if st.session_state.results and isinstance(st.session_state.results, dict):
+        failed_info = get_failed_rows_info(st.session_state.results)
+        total_errors = sum(len(rows) for rows in failed_info.values())
+
+        if total_errors > 0:
+            st.info(f"Previous results have {total_errors} errors")
+
+            if hasattr(st.session_state, 'last_tagging_jobs') and st.session_state.last_tagging_jobs:
+                if st.button("Retry Failed Rows", type="secondary"):
+                    retry_failed_rows(
+                        st.session_state.last_tagging_jobs,
+                        failed_info,
+                        max_workers=5,
+                        batch_size=100,
+                        search_retries=3
+                    )
+
+        # Show results
+        create_download_buttons(st.session_state.results,
+                               getattr(st.session_state, 'last_tagging_jobs', None))
+        st.markdown("---")
 
     if not st.session_state.sheet_data or not st.session_state.tagging_configs:
         st.warning("Complete setup in previous tabs first.")
